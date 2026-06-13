@@ -4,6 +4,9 @@ import sharp from 'sharp';
 import fs from 'fs';
 import path from 'path';
 
+const IS_PROD = process.env.NODE_ENV === 'production';
+const MIN_WIDTH = IS_PROD ? 2200 : 3000;
+
 // Major Indian cities list for verification and precise boundary detection
 const knownCities = [
   'HYDERABAD', 'BANGALORE', 'BENGALURU', 'CHENNAI', 'MUMBAI', 
@@ -684,7 +687,7 @@ function parseExtractedTextWithLayout(rawText, blocks, pageNumber = 1, sourceFil
       }
     }
   }
-  if (maxX === 0) maxX = 3000;
+  if (maxX === 0) maxX = MIN_WIDTH;
   if (maxY === 0) maxY = 4000;
 
   // 2. Identify the starting coordinates of the rightmost numeric amount values on the page
@@ -934,8 +937,8 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
       const height = metadata.height || 0;
       
       let scale = 1;
-      if (width < 3000) {
-        scale = Math.ceil(3000 / width);
+      if (width < MIN_WIDTH) {
+        scale = Math.ceil(MIN_WIDTH / width);
       }
       
       let sharpPipeline = sharp(fileBuffer);
@@ -958,11 +961,17 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
         .png()
         .toBuffer();
         
-      const debugDir = path.join(process.cwd(), 'debug_pages');
-      if (!fs.existsSync(debugDir)) {
-        fs.mkdirSync(debugDir, { recursive: true });
+      if (!IS_PROD) {
+        const debugDir = path.join(process.cwd(), 'debug_pages');
+        if (!fs.existsSync(debugDir)) {
+          fs.mkdirSync(debugDir, { recursive: true });
+        }
+        try {
+          fs.writeFileSync(path.join(debugDir, 'page-1.png'), optimizedPageBufferA);
+        } catch (e) {
+          console.error('Failed to write debug page image:', e);
+        }
       }
-      fs.writeFileSync(path.join(debugDir, 'page-1.png'), optimizedPageBufferA);
       
       const retA = await worker.recognize(optimizedPageBufferA, {}, { blocks: true });
       const pageResultA = parseExtractedTextWithLayout(retA.data.text, retA.data.blocks, 1, fileName, {}, corrections);
@@ -1079,7 +1088,7 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
             }
           }
         }
-        if (maxX === 0) maxX = 3000;
+        if (maxX === 0) maxX = MIN_WIDTH;
         if (maxY === 0) maxY = 4000;
 
         const candidateLines = [];
@@ -1206,7 +1215,9 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
       console.log(`[OCR Debug] Starting PDF processing for ${fileName}. Total pages: ${pageCount}`);
       
       for (let p = 1; p <= pageCount; p++) {
-        const page = await pdf.getPage(p);
+        console.log(`[OCR] PDF page ${p} started`);
+        try {
+          const page = await pdf.getPage(p);
         const opList = await page.getOperatorList();
         
         let imgId = null;
@@ -1232,8 +1243,8 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
         const channels = imgObj.kind === 3 ? 4 : (imgObj.kind === 2 ? 3 : 1);
         
         let scale = 1;
-        if (imgObj.width < 3000) {
-          scale = Math.ceil(3000 / imgObj.width);
+        if (imgObj.width < MIN_WIDTH) {
+          scale = Math.ceil(MIN_WIDTH / imgObj.width);
         }
         
         let sharpPipeline = sharp(imgObj.data, {
@@ -1261,11 +1272,17 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
           .png()
           .toBuffer();
           
-        const debugDir = path.join(process.cwd(), 'debug_pages');
-        if (!fs.existsSync(debugDir)) {
-          fs.mkdirSync(debugDir, { recursive: true });
+        if (!IS_PROD) {
+          try {
+            const debugDir = path.join(process.cwd(), 'debug_pages');
+            if (!fs.existsSync(debugDir)) {
+              fs.mkdirSync(debugDir, { recursive: true });
+            }
+            fs.writeFileSync(path.join(debugDir, `page-${p}.png`), optimizedPageBufferA);
+          } catch (e) {
+            console.error('Failed to write debug page image:', e);
+          }
         }
-        fs.writeFileSync(path.join(debugDir, `page-${p}.png`), optimizedPageBufferA);
         
         const retA = await worker.recognize(optimizedPageBufferA, {}, { blocks: true });
         const pageResultA = parseExtractedTextWithLayout(retA.data.text, retA.data.blocks, p, fileName, {}, corrections);
@@ -1282,7 +1299,7 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
 
         const isStandardPassWeak = pageResultA.extractedRows.length < 5 || avgConfA < 70;
 
-        if (isStandardPassWeak && pageResultA.extractedRows.length > 0) {
+        if (!IS_PROD && isStandardPassWeak && pageResultA.extractedRows.length > 0) {
           console.log(`[OCR Debug] Standard pass for Page ${p} is weak (rows: ${pageResultA.extractedRows.length}, avgConf: ${avgConfA}%). Running multi-pass preprocessing...`);
 
           // Pass B: Threshold
@@ -1365,7 +1382,7 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
         }
 
         let cropData = {};
-        if (needsSecondaryCrop) {
+        if (needsSecondaryCrop && !IS_PROD) {
           console.log(`[OCR Debug] Page ${p}: Identified rows needing correction. Running secondary cropped column OCR passes...`);
           let maxX = 0;
           let maxY = 0;
@@ -1385,7 +1402,7 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
               }
             }
           }
-          if (maxX === 0) maxX = 3000;
+          if (maxX === 0) maxX = MIN_WIDTH;
           if (maxY === 0) maxY = 4000;
 
           const candidateLines = [];
@@ -1489,35 +1506,59 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
           bestRows = finalPageResult.extractedRows;
         }
 
-        allRows.push(...bestRows);
-        
-        debugData.push({
-          pageNumber: p,
-          rawText: bestOcrText,
-          rawLines: bestRows.map(r => r.originalText),
-          candidateLines: bestRows.map(r => r.originalText),
-          extractedRows: bestRows
-        });
-        
-        console.log(`[OCR Debug] Processed page ${p} / ${pageCount}`);
-        console.log(`  - OCR text length: ${bestOcrText.length} characters`);
-        console.log(`  - Final extracted rows: ${bestRows.length}`);
+          allRows.push(...bestRows);
+          
+          debugData.push({
+            pageNumber: p,
+            rawText: bestOcrText,
+            rawLines: bestRows.map(r => r.originalText),
+            candidateLines: bestRows.map(r => r.originalText),
+            extractedRows: bestRows
+          });
+          
+          console.log(`[OCR Debug] Processed page ${p} / ${pageCount}`);
+          console.log(`  - OCR text length: ${bestOcrText.length} characters`);
+          console.log(`  - Final extracted rows: ${bestRows.length}`);
+        } catch (pageErr) {
+          console.error(`[OCR Error] Page ${p} processing failed:`, pageErr);
+          debugData.push({ pageNumber: p, error: pageErr && pageErr.message ? pageErr.message : String(pageErr) });
+        } finally {
+          console.log(`PDF page ${p} completed`);
+          try {
+            console.log(`Memory usage after page ${p}: ${JSON.stringify(process.memoryUsage())}`);
+          } catch (e) {
+            // ignore
+          }
+        }
       }
     } else {
       throw new Error(`Unsupported file type: ${mimeType}`);
     }
     
-    // Save raw_ocr_debug.json
-    fs.writeFileSync(
-      path.join(process.cwd(), 'raw_ocr_debug.json'),
-      JSON.stringify(debugData, null, 2)
-    );
-    console.log(`[OCR Debug] Successfully saved raw_ocr_debug.json`);
+    // Save raw_ocr_debug.json (only in non-production)
+    if (!IS_PROD) {
+      try {
+        fs.writeFileSync(
+          path.join(process.cwd(), 'raw_ocr_debug.json'),
+          JSON.stringify(debugData, null, 2)
+        );
+        console.log(`[OCR Debug] Successfully saved raw_ocr_debug.json`);
+      } catch (e) {
+        console.error('Failed to write raw_ocr_debug.json:', e);
+      }
+    }
     console.log(`[OCR Debug] Total PDF pages processed: ${pageCount}`);
     
   } catch (err) {
     console.error('Error during OCR execution:', err);
-    throw err;
+    return {
+      error: true,
+      message: err && err.message ? err.message : String(err),
+      rows: allRows,
+      pageCount,
+      totalExtracted: allRows.length,
+      needsReviewCount: allRows.filter(r => r.needsReview || r.status === 'Needs Review').length
+    };
   } finally {
     await worker.terminate();
   }

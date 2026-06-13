@@ -132,8 +132,12 @@ app.post('/api/extract', (req, res) => {
       console.log(`Executing Pro Backend OCR extraction for: ${originalname} (${mimetype}), Size: ${(buffer.length / (1024 * 1024)).toFixed(2)} MB`);
 
       const result = await processFileForOcr(buffer, mimetype, originalname);
+      if (!result || result.error) {
+        console.error('OCR service returned an error:', result && result.message ? result.message : result);
+        return res.status(500).json({ success: false, message: result && result.message ? result.message : 'OCR processing failed on the server.', rows: result && result.rows ? result.rows : [] });
+      }
 
-      if (result.rows.length === 0) {
+      if (!Array.isArray(result.rows) || result.rows.length === 0) {
         return res.status(422).json({
           success: false,
           message: 'Empty extracted data. We could not detect any valid customer records or amounts in this document. Please verify image quality or orientation.'
