@@ -2,7 +2,8 @@ import axios from 'axios';
 import { saveAs } from 'file-saver';
 import { ApiExtractResponse, ExtractedRow } from '../types';
 
-const API_BASE_URL = 'http://localhost:5001';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001';
+console.log("API_BASE_URL:", API_BASE_URL);
 
 export class ExpressApiClient {
   private baseUrl: string = API_BASE_URL;
