@@ -1,0 +1,67 @@
+### Paisadu Data Extractor API Endpoints Test File
+
+### Health Check / Info Endpoint
+GET http://localhost:5001/api
+Accept: application/json
+
+
+### Export Edited Rows to Excel
+POST http://localhost:5001/api/export/excel
+Content-Type: application/json
+
+{
+  "rows": [
+    {
+      "pageNumber": 1,
+      "rowNumber": 1,
+      "city": "BANGALORE",
+      "phoneNumber": "+91-9845012345",
+      "amount": 45000,
+      "originalOcrText": "PRP-001 | TechPark Towers BANGALORE PINCODE | MOBILE: +91-9845012345 | 45000",
+      "confidence": 98,
+      "needsReview": false
+    },
+    {
+      "pageNumber": 2,
+      "rowNumber": 2,
+      "city": "HYDERABAD",
+      "phoneNumber": "040-23456789",
+      "amount": 62500,
+      "originalOcrText": "PRP-002 | Banjara Hills Heights HYDERABAD PINCODE | PHONE: 040-23456789 | 62500",
+      "confidence": 85,
+      "needsReview": true
+    }
+  ],
+  "includeOcrText": true
+}
+
+
+### Export Edited Rows to PDF Report
+POST http://localhost:5001/api/export/pdf
+Content-Type: application/json
+
+{
+  "title": "Monthly Scanned Extract Report",
+  "rows": [
+    {
+      "pageNumber": 1,
+      "rowNumber": 1,
+      "city": "BANGALORE",
+      "phoneNumber": "+91-9845012345",
+      "amount": 45000,
+      "originalOcrText": "PRP-001 | TechPark Towers BANGALORE PINCODE | MOBILE: +91-9845012345 | 45000",
+      "confidence": 98,
+      "needsReview": false
+    },
+    {
+      "pageNumber": 2,
+      "rowNumber": 2,
+      "city": "HYDERABAD",
+      "phoneNumber": "040-23456789",
+      "amount": 62500,
+      "originalOcrText": "PRP-002 | Banjara Hills Heights HYDERABAD PINCODE | PHONE: 040-23456789 | 62500",
+      "confidence": 85,
+      "needsReview": true
+    }
+  ]
+}
