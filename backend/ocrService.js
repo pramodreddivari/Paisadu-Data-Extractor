@@ -3,9 +3,11 @@ import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 import sharp from 'sharp';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
 const IS_PROD = process.env.NODE_ENV === 'production';
-const MIN_WIDTH = IS_PROD ? 2200 : 3000;
+const MIN_WIDTH = IS_PROD ? 1200 : 3000;
+const PROD_PDF_MAX_RSS_MB = Number(process.env.OCR_MAX_RSS_MB || 430);
 
 // Major Indian cities list for verification and precise boundary detection
 const knownCities = [
@@ -22,10 +24,10 @@ const knownCities = [
 function getCorrectionsPath() {
   const cwd = process.cwd();
   if (fs.existsSync(path.join(cwd, 'backend'))) {
-    return path.join(cwd, 'backend', 'corrections.json');
+    return path.join(cwd, 'corrections.json');
   }
   if (path.basename(cwd) === 'backend') {
-    return path.join(cwd, 'corrections.json');
+    return path.join(path.dirname(cwd), 'corrections.json');
   }
   return path.join(cwd, 'corrections.json');
 }
@@ -41,6 +43,24 @@ function loadCorrections() {
     }
   }
   return [];
+}
+
+function getMemorySnapshot() {
+  const memory = process.memoryUsage();
+  return {
+    rssMb: Math.round(memory.rss / 1024 / 1024),
+    heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024),
+    externalMb: Math.round(memory.external / 1024 / 1024),
+    arrayBuffersMb: Math.round(memory.arrayBuffers / 1024 / 1024)
+  };
+}
+
+function logMemory(label) {
+  console.log(`[OCR Memory] ${label}: ${JSON.stringify(getMemorySnapshot())}`);
+}
+
+function isProductionPdfMemoryUnsafe() {
+  return IS_PROD && getMemorySnapshot().rssMb >= PROD_PDF_MAX_RSS_MB;
 }
 
 // Token Jaccard similarity for learning suggestions
@@ -162,13 +182,520 @@ function getFieldConfidence(fieldValue, words, type) {
   return Math.round(allSum / words.length) || 80;
 }
 
-// Match cropped amount column value to main lines by Y-coordinate
-function findCropAmountForLine(line, cropBlocks) {
-  if (!line.bbox) return null;
-  const lineY0 = line.bbox.y0;
-  const lineY1 = line.bbox.y1;
+// Levenshtein distance helper for fuzzy matching
+function getLevenshteinDistance(a, b) {
+  const tmp = [];
+  for (let i = 0; i <= a.length; i++) {
+    tmp[i] = [i];
+  }
+  for (let j = 0; j <= b.length; j++) {
+    tmp[0][j] = j;
+  }
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      tmp[i][j] = Math.min(
+        tmp[i - 1][j] + 1, // deletion
+        tmp[i][j - 1] + 1, // insertion
+        tmp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1) // substitution
+      );
+    }
+  }
+  return tmp[a.length][b.length];
+}
 
+// Normalize common OCR digit mistakes (e.g. O->0, I/l->1, S->5, B->8)
+function normalizeOcrDigits(text) {
+  if (!text) return '';
+  return text
+    .replace(/[Oo]/g, '0')
+    .replace(/[Ii|ltT\[\]]/g, '1')
+    .replace(/[S§s]/g, '5')
+    .replace(/[Zz]/g, '2')
+    .replace(/[gGqQ]/g, '9')
+    .replace(/B/g, '8')
+    .replace(/b/g, '6')
+    .replace(/\s+/g, '');
+}
+
+// Estimate quality based on dimensions and OCR confidence
+function estimateQuality(meta, ocrConfidence) {
+  const width = meta.width || 0;
+  const height = meta.height || 0;
+  const isLowRes = width < 1500 || height < 1500;
+  const isBlurry = ocrConfidence < 70;
+  const isSkewed = false; // Placeholder
+
+  let rating = 'High';
+  if (isLowRes && isBlurry) rating = 'Low';
+  else if (isLowRes || isBlurry) rating = 'Medium';
+
+  return {
+    width,
+    height,
+    orientation: width > height ? 'Landscape' : 'Portrait',
+    isLowResolution: isLowRes,
+    isBlurry,
+    isSkewed,
+    qualityRating: rating
+  };
+}
+
+// Generate preprocessed buffer based on variant mode and scale factor
+async function getPreprocessedBuffer(inputBufferOrRaw, rawMeta, variant, scale) {
+  let pipeline;
+  if (rawMeta) {
+    pipeline = sharp(inputBufferOrRaw, {
+      raw: {
+        width: rawMeta.width,
+        height: rawMeta.height,
+        channels: rawMeta.channels
+      }
+    });
+  } else {
+    pipeline = sharp(inputBufferOrRaw);
+  }
+
+  // Handle scaling (resize)
+  if (scale > 1) {
+    const meta = rawMeta ? null : await pipeline.metadata();
+    const w = rawMeta ? rawMeta.width : (meta ? meta.width : 1200) || 1200;
+    const h = rawMeta ? rawMeta.height : (meta ? meta.height : 1600) || 1600;
+    pipeline = pipeline.resize({
+      width: w * scale,
+      height: h * scale,
+      kernel: sharp.kernel.lanczos3
+    });
+  }
+
+  if (variant === 'A') {
+    // Pass A: Grayscale + Sharpen + Normalize
+    return await pipeline
+      .greyscale()
+      .normalize()
+      .sharpen()
+      .png()
+      .toBuffer();
+  } else if (variant === 'B') {
+    // Pass B: Grayscale + Threshold (160) + Denoise
+    return await pipeline
+      .greyscale()
+      .threshold(160)
+      .median(1)
+      .png()
+      .toBuffer();
+  } else if (variant === 'C') {
+    // Pass C: Enlarged 2x + Grayscale + Sharpen + Normalize
+    const meta = rawMeta ? null : await pipeline.metadata();
+    const w = rawMeta ? rawMeta.width : (meta ? meta.width : 1200) || 1200;
+    const h = rawMeta ? rawMeta.height : (meta ? meta.height : 1600) || 1600;
+    return await pipeline
+      .resize({
+        width: w * 2,
+        height: h * 2,
+        kernel: sharp.kernel.lanczos3
+      })
+      .greyscale()
+      .normalize()
+      .sharpen()
+      .png()
+      .toBuffer();
+  } else if (variant === 'D') {
+    // Pass D: Grayscale + Contrast Adjustment + Normalize
+    return await pipeline
+      .greyscale()
+      .linear(1.2, -20)
+      .png()
+      .toBuffer();
+  }
+
+  return await pipeline.png().toBuffer();
+}
+
+// Compute quality score for selecting best primary OCR pass
+function scoreOcrResult(result) {
+  if (!result || !result.extractedRows) return -999;
+  const rows = result.extractedRows;
+  let score = rows.length * 15;
+  let okRows = 0;
+  let validPhones = 0;
+  let validAmounts = 0;
+  let matchedCities = 0;
+  let totalConf = 0;
+
+  for (const r of rows) {
+    if (r.status === 'OK') okRows++;
+    if (r.phoneNumber && /^[6-9]\d{9}$/.test(r.phoneNumber)) validPhones++;
+    if (r.amount && parseFloat(r.amount) >= 10000) validAmounts++;
+    if (r.city && r.city !== 'Needs Review' && r.city !== 'Needs Entry') matchedCities++;
+    totalConf += r.confidence || 0;
+  }
+
+  score += okRows * 20;
+  score += validPhones * 15;
+  score += validAmounts * 15;
+  score += matchedCities * 10;
+  score += rows.length > 0 ? (totalConf / rows.length) : 0;
+  return score;
+}
+
+// Split multi-column customer table layouts horizontally
+function splitMultiColumnGroup(group) {
+  const pinWords = group.words.filter(w => /PINCODE|P1NC0DE|PIN\s+CODE/i.test(w.text || ''));
+  if (pinWords.length <= 1) {
+    return [{
+      bbox: group.bbox,
+      text: group.words.map(w => w.text).join(' ').trim(),
+      words: group.words
+    }];
+  }
+
+  // Sort pinWords horizontally by X coordinate
+  pinWords.sort((a, b) => (a.bbox?.x0 ?? 0) - (b.bbox?.x0 ?? 0));
+
+  const subGroups = [];
+  let lastSplitX = 0;
+
+  for (let i = 0; i < pinWords.length; i++) {
+    const currentPinX = pinWords[i].bbox?.x0 ?? 0;
+    let splitX = 999999;
+    if (i < pinWords.length - 1) {
+      const nextPinX = pinWords[i + 1].bbox?.x0 ?? 0;
+      splitX = (currentPinX + nextPinX) / 2;
+    }
+
+    const subWords = group.words.filter(w => {
+      const x0 = w.bbox?.x0 ?? 0;
+      return x0 >= lastSplitX && x0 < splitX;
+    });
+
+    if (subWords.length > 0) {
+      subWords.sort((a, b) => (a.bbox?.x0 ?? 0) - (b.bbox?.x0 ?? 0));
+      const subText = subWords.map(w => w.text).join(' ').trim();
+
+      const subX0 = Math.min(...subWords.map(w => w.bbox?.x0 ?? 0));
+      const subX1 = Math.max(...subWords.map(w => w.bbox?.x1 ?? 0));
+      const subY0 = Math.min(...subWords.map(w => w.bbox?.y0 ?? group.bbox.y0));
+      const subY1 = Math.max(...subWords.map(w => w.bbox?.y1 ?? group.bbox.y1));
+
+      subGroups.push({
+        bbox: { x0: subX0, x1: subX1, y0: subY0, y1: subY1 },
+        text: subText,
+        words: subWords
+      });
+    }
+    lastSplitX = splitX;
+  }
+  return subGroups;
+}
+
+// Extract best valid mobile and find other candidates
+function extractAllPhoneNumbers(lineText) {
+  if (!lineText) return { best: '', others: [] };
+  const cleanLine = lineText.toUpperCase();
+  const candRegex = /[0-9OolIL|tTS§sbB\s\-\(\)\+]{7,22}/g;
+  const matches = cleanLine.match(candRegex) || [];
+
+  const phoneCandidates = [];
+  const pincodeMatch = lineText.match(/(?:PINCODE|P1NC0DE|PIN\s+CODE)?\s*\b(\d{6})\b/i);
+  const pincode = pincodeMatch ? pincodeMatch[1] : '';
+
+  for (const rawCand of matches) {
+    const cleaned = normalizeOcrDigits(rawCand);
+    const digits = cleaned.replace(/\D/g, '');
+    if (digits.length >= 10) {
+      const phone10 = digits.slice(-10);
+      if (/^[6-9]\d{9}$/.test(phone10)) {
+        if (!pincode || !phone10.includes(pincode)) {
+          if (!phoneCandidates.includes(phone10)) {
+            phoneCandidates.push(phone10);
+          }
+        }
+      }
+    }
+  }
+
+  if (phoneCandidates.length === 0) {
+    return { best: '', others: [] };
+  }
+
+  let bestPhone = phoneCandidates[0];
+  let minDistance = 999;
+  const keywords = ['MOBILE', 'PHONE', 'MOB', 'PH', 'M0B1LE', 'M0BILE', 'PH0NE'];
+  for (const kw of keywords) {
+    const kwIdx = cleanLine.indexOf(kw);
+    if (kwIdx !== -1) {
+      for (const cand of phoneCandidates) {
+        const candIdx = cleanLine.indexOf(cand);
+        if (candIdx !== -1) {
+          const dist = Math.abs(candIdx - kwIdx);
+          if (dist < minDistance) {
+            minDistance = dist;
+            bestPhone = cand;
+          }
+        }
+      }
+    }
+  }
+
+  const others = phoneCandidates.filter(p => p !== bestPhone);
+  return { best: bestPhone, others };
+}
+
+// Process a single PDF page render or direct image upload with preprocessors
+async function processPageImage(inputBufferOrRaw, rawMeta, pageNumber, fileName, isTruncated, corrections, worker) {
+  let width = 0;
+  let height = 0;
+  let channels = 3;
+
+  if (rawMeta) {
+    width = rawMeta.width;
+    height = rawMeta.height;
+    channels = rawMeta.channels;
+  } else {
+    try {
+      const meta = await sharp(inputBufferOrRaw).metadata();
+      width = meta.width || 1200;
+      height = meta.height || 1600;
+      channels = meta.channels || 3;
+    } catch (e) {
+      console.warn("Failed to get image metadata:", e);
+      width = 1200;
+      height = 1600;
+    }
+  }
+
+  let scale = 1;
+  if (width < MIN_WIDTH) {
+    scale = Math.ceil(MIN_WIDTH / width);
+  }
+
+  console.log(`[OCR Debug] Page ${pageNumber}: Running primary OCR Pass A...`);
+  const bufferA = await getPreprocessedBuffer(inputBufferOrRaw, rawMeta, 'A', scale);
+
+  if (!IS_PROD) {
+    const debugDir = path.join(os.tmpdir(), 'paisadu_debug_pages');
+    if (!fs.existsSync(debugDir)) {
+      fs.mkdirSync(debugDir, { recursive: true });
+    }
+    try {
+      fs.writeFileSync(path.join(debugDir, `page-${pageNumber}.png`), bufferA);
+    } catch (e) {
+      console.error('Failed to write debug page image:', e);
+    }
+  }
+
+  const retA = await worker.recognize(bufferA, {}, { blocks: true });
+  const resultA = parseExtractedTextWithLayout(retA.data.text, retA.data.blocks, pageNumber, fileName, { isTruncated }, corrections);
+  const scoreA = scoreOcrResult(resultA);
+  const avgConfA = retA.data.confidence || 0;
+
+  let bestVariant = 'A';
+  let bestRows = resultA.extractedRows;
+  let bestOcrText = retA.data.text;
+  let bestBlocks = retA.data.blocks;
+  let bestBuffer = bufferA;
+  let bestScore = scoreA;
+  let bestConf = avgConfA;
+
+  const isStandardPassWeak = resultA.extractedRows.length === 0 || avgConfA < 75;
+
+  if (isStandardPassWeak) {
+    console.log(`[OCR Debug] Page ${pageNumber}: Standard pass is weak (rows: ${resultA.extractedRows.length}, avgConf: ${avgConfA}%, score: ${scoreA}). Running fallback passes...`);
+    const variants = ['B', 'C', 'D'];
+    for (const v of variants) {
+      try {
+        console.log(`[OCR Debug] Page ${pageNumber}: Running Pass ${v}...`);
+        const buf = await getPreprocessedBuffer(inputBufferOrRaw, rawMeta, v, scale);
+        const ret = await worker.recognize(buf, {}, { blocks: true });
+        const res = parseExtractedTextWithLayout(ret.data.text, ret.data.blocks, pageNumber, fileName, { isTruncated }, corrections);
+        const score = scoreOcrResult(res);
+        const conf = ret.data.confidence || 0;
+
+        console.log(`[OCR Debug] Pass ${v} result: rows=${res.extractedRows.length}, conf=${conf}%, score=${score}`);
+        if (score > bestScore || (score === bestScore && conf > bestConf)) {
+          bestVariant = v;
+          bestRows = res.extractedRows;
+          bestOcrText = ret.data.text;
+          bestBlocks = ret.data.blocks;
+          bestBuffer = buf;
+          bestScore = score;
+          bestConf = conf;
+        }
+      } catch (err) {
+        console.error(`Error in preprocessing variant ${v}:`, err);
+      }
+    }
+    console.log(`[OCR Debug] Page ${pageNumber}: Selected best variant ${bestVariant} (score: ${bestScore})`);
+  }
+
+  let needsSecondaryCrop = false;
+  for (const row of bestRows) {
+    const hasLowConf = row.cityConfidence < 70 || row.phoneConfidence < 70 || row.amountConfidence < 70;
+    const hasInvalidPhone = !row.phoneNumber || !/^[6-9]\d{9}$/.test(row.phoneNumber);
+    const hasSuspiciousAmount = !row.amount || parseFloat(row.amount) === 0 || row.amount.toString().length >= 10 ||
+                                (row.amount.toString().length >= 8 && row.amount.toString().startsWith('1')) ||
+                                row.phoneNumber === row.amount.toString() ||
+                                row.needsReview || row.status !== 'OK';
+
+    if (hasLowConf || hasInvalidPhone || hasSuspiciousAmount) {
+      needsSecondaryCrop = true;
+      break;
+    }
+  }
+
+  let cropData = { isTruncated };
+  if (needsSecondaryCrop && !isTruncated) {
+    console.log(`[OCR Debug] Page ${pageNumber}: Running secondary cropped column OCR passes...`);
+    let maxX = 0;
+    let maxY = 0;
+    if (bestBlocks) {
+      for (const block of bestBlocks) {
+        if (block.paragraphs) {
+          for (const para of block.paragraphs) {
+            if (para.lines) {
+              for (const line of para.lines) {
+                if (line.bbox) {
+                  if (line.bbox.x1 > maxX) maxX = line.bbox.x1;
+                  if (line.bbox.y1 > maxY) maxY = line.bbox.y1;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (maxX === 0) maxX = MIN_WIDTH;
+    if (maxY === 0) maxY = 4000;
+
+    const candidateLines = [];
+    if (bestBlocks) {
+      for (const block of bestBlocks) {
+        if (block.paragraphs) {
+          for (const para of block.paragraphs) {
+            if (para.lines) {
+              for (const line of para.lines) {
+                if (/PINCODE/i.test(line.text)) {
+                  candidateLines.push(line);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const rightmostX0s = [];
+    let phoneX0s = [];
+    let phoneX1s = [];
+
+    for (const line of candidateLines) {
+      const words = line.words || [];
+      for (let i = words.length - 1; i >= 0; i--) {
+        const w = words[i];
+        const text = w.text || '';
+        const cleanWord = text.replace(/[^a-zA-Z0-9]/g, '');
+        const hasDigits = /[0-9]/.test(text) || /Tooooo/i.test(text) || /Tase000/i.test(text) || /Toso/i.test(text);
+
+        if (hasDigits && cleanWord.length >= 3) {
+          if (w.bbox && w.bbox.x0 > 0.80 * maxX) {
+            rightmostX0s.push(w.bbox.x0);
+            break;
+          }
+        }
+      }
+
+      words.forEach(w => {
+        const text = w.text || '';
+        if (/PHONE|MOBILE|PH|MOB/i.test(text) || (/^[6-9]\d{9}$/.test(text.replace(/\D/g, '')))) {
+          if (w.bbox) {
+            phoneX0s.push(w.bbox.x0);
+            phoneX1s.push(w.bbox.x1);
+          }
+        }
+      });
+    }
+
+    let amountColStart = Math.round(0.825 * maxX);
+    if (rightmostX0s.length > 0) {
+      const sorted = rightmostX0s.sort((a, b) => a - b);
+      const minX0 = sorted[0];
+      amountColStart = Math.max(Math.round(0.80 * maxX), Math.min(Math.round(0.83 * maxX), minX0 - 10));
+    }
+
+    let phoneColStart = Math.round(0.50 * maxX);
+    let phoneColEnd = Math.round(0.80 * maxX);
+    if (phoneX0s.length > 0 && phoneX1s.length > 0) {
+      phoneColStart = Math.max(0, Math.min(...phoneX0s) - 20);
+      phoneColEnd = Math.min(maxX, Math.max(...phoneX1s) + 20);
+    }
+    if (phoneColEnd >= amountColStart) {
+      phoneColEnd = amountColStart - 20;
+    }
+
+    try {
+      let cropLeft = Math.max(0, Math.min(amountColStart + 10, maxX - 10));
+      let cropWidth = Math.max(10, maxX - cropLeft);
+      const amountCropBuffer = await sharp(bestBuffer)
+        .extract({ left: cropLeft, top: 0, width: cropWidth, height: maxY })
+        .toBuffer();
+
+      await worker.setParameters({ tessedit_char_whitelist: '0123456789\n\r ' });
+      const amtCropRet = await worker.recognize(amountCropBuffer, {}, { blocks: true });
+      cropData.amountCropBlocks = amtCropRet.data.blocks;
+    } catch (cropAmtErr) {
+      console.error("Secondary crop amount OCR failure:", cropAmtErr);
+    }
+
+    try {
+      let cropLeft = Math.max(0, phoneColStart);
+      let cropWidth = Math.max(10, phoneColEnd - phoneColStart);
+      const phoneCropBuffer = await sharp(bestBuffer)
+        .extract({ left: cropLeft, top: 0, width: cropWidth, height: maxY })
+        .toBuffer();
+
+      await worker.setParameters({ tessedit_char_whitelist: '0123456789\n\r ' });
+      const phoneCropRet = await worker.recognize(phoneCropBuffer, {}, { blocks: true });
+      cropData.phoneCropBlocks = phoneCropRet.data.blocks;
+    } catch (cropPhoneErr) {
+      console.error("Secondary crop phone OCR failure:", cropPhoneErr);
+    }
+
+    await worker.setParameters({ tessedit_char_whitelist: '' });
+
+    const finalPageResult = parseExtractedTextWithLayout(bestOcrText, bestBlocks, pageNumber, fileName, cropData, corrections);
+    bestRows = finalPageResult.extractedRows;
+  }
+
+  const quality = estimateQuality({ width: width * scale, height: height * scale }, bestConf);
+
+  return {
+    rows: bestRows,
+    ocrText: bestOcrText,
+    ocrBlocks: bestBlocks,
+    variant: bestVariant,
+    confidence: bestConf,
+    qualityRating: quality.qualityRating,
+    qualityMeta: {
+      width: width * scale,
+      height: height * scale,
+      orientation: quality.orientation,
+      isLowResolution: quality.isLowResolution,
+      isBlurry: quality.isBlurry,
+      isSkewed: quality.isSkewed,
+      isTruncated,
+      preprocessingMode: bestVariant,
+      ocrConfidence: bestConf,
+      qualityRating: quality.qualityRating
+    }
+  };
+}
+
+// Match cropped amount column value to grouped row by Y-coordinate
+function findCropAmountForGroup(group, cropBlocks) {
+  const rowY0 = group.bbox.y0;
+  const rowY1 = group.bbox.y1;
   const matches = [];
+
   if (cropBlocks) {
     for (const block of cropBlocks) {
       if (block.paragraphs) {
@@ -179,7 +706,7 @@ function findCropAmountForLine(line, cropBlocks) {
                 for (const w of clink.words) {
                   if (w.bbox) {
                     const wCenter = (w.bbox.y0 + w.bbox.y1) / 2;
-                    if (wCenter >= lineY0 - 5 && wCenter <= lineY1 + 5) {
+                    if (wCenter >= rowY0 - 10 && wCenter <= rowY1 + 10) {
                       matches.push(w);
                     }
                   }
@@ -210,7 +737,7 @@ function findCropAmountForLine(line, cropBlocks) {
   if (combined.length >= 4) {
     const lastWord = matches[matches.length - 1];
     return {
-      amount: lastWord.text.replace(/\D/g, ''),
+      amount: combined,
       confidence: lastWord.confidence
     };
   }
@@ -218,13 +745,12 @@ function findCropAmountForLine(line, cropBlocks) {
   return null;
 }
 
-// Match cropped phone column value to main lines by Y-coordinate
-function findCropPhoneForLine(line, cropBlocks) {
-  if (!line.bbox) return null;
-  const lineY0 = line.bbox.y0;
-  const lineY1 = line.bbox.y1;
-
+// Match cropped phone column value to grouped row by Y-coordinate
+function findCropPhoneForGroup(group, cropBlocks) {
+  const rowY0 = group.bbox.y0;
+  const rowY1 = group.bbox.y1;
   const matches = [];
+
   if (cropBlocks) {
     for (const block of cropBlocks) {
       if (block.paragraphs) {
@@ -235,7 +761,7 @@ function findCropPhoneForLine(line, cropBlocks) {
                 for (const w of clink.words) {
                   if (w.bbox) {
                     const wCenter = (w.bbox.y0 + w.bbox.y1) / 2;
-                    if (wCenter >= lineY0 - 5 && wCenter <= lineY1 + 5) {
+                    if (wCenter >= rowY0 - 10 && wCenter <= rowY1 + 10) {
                       matches.push(w);
                     }
                   }
@@ -310,7 +836,52 @@ function normalizeCity(cityWord) {
   return w;
 }
 
+// Fuzzy match city names as fallback
+function extractCityFuzzy(text) {
+  if (!text) return '';
+  const cleanText = text.toUpperCase().replace(/[^A-Z\s]/g, ' ');
+  const words = cleanText.split(/\s+/).filter(w => w.length >= 3);
+  
+  // Fuzzy match single words
+  let bestCity = '';
+  let minDistance = 999;
+  
+  for (const word of words) {
+    for (const city of knownCities) {
+      if (city.includes(' ')) continue;
+      const dist = getLevenshteinDistance(word, city);
+      const limit = city.length > 6 ? 2 : 1;
+      if (dist <= limit && dist < minDistance) {
+        minDistance = dist;
+        bestCity = city;
+      }
+    }
+  }
+
+  // Fuzzy match multi-word cities using bigrams
+  if (minDistance > 1) {
+    for (let i = 0; i < words.length - 1; i++) {
+      const bigram = `${words[i]} ${words[i+1]}`;
+      for (const city of knownCities) {
+        if (!city.includes(' ')) continue;
+        const dist = getLevenshteinDistance(bigram, city);
+        if (dist <= 2 && dist < minDistance) {
+          minDistance = dist;
+          bestCity = city;
+        }
+      }
+    }
+  }
+
+  if (bestCity && minDistance <= 2) {
+    return bestCity;
+  }
+
+  return '';
+}
+
 function extractCity(line) {
+  if (!line) return '';
   const upperLine = line.toUpperCase();
   
   // 1. Explicit multi-word/special cities checks first (priority)
@@ -327,7 +898,20 @@ function extractCity(line) {
     return 'NAVI MUMBAI';
   }
 
-  // 2. Scan before PINCODE for other cities
+  // 2. Try to find a known city (exact or fuzzy) in the entire line first
+  for (const kc of knownCities) {
+    const regex = new RegExp(`\\b${kc}\\b`, 'i');
+    if (regex.test(upperLine)) {
+      return kc;
+    }
+  }
+
+  const fuzzyMatched = extractCityFuzzy(upperLine);
+  if (fuzzyMatched) {
+    return fuzzyMatched;
+  }
+
+  // 3. Scan before PINCODE for other custom/unknown cities
   const pinMatch = line.match(/(?:PINCODE|P1NC0DE|PIN\s+CODE)/i);
   if (pinMatch) {
     const pinIndex = pinMatch.index;
@@ -335,13 +919,6 @@ function extractCity(line) {
     const cleanedText = textBeforePin.replace(/([a-zA-Z])\.([a-zA-Z])/g, '$1$2');
     const words = cleanedText.split(/[^A-Za-z]+/).filter(w => w.length > 0);
     
-    // Search words from right to left
-    for (let i = words.length - 1; i >= 0; i--) {
-      const normalized = normalizeCity(words[i]);
-      if (knownCities.includes(normalized)) {
-        return normalized;
-      }
-    }
     if (words.length > 0) {
       const lastWord = words[words.length - 1].toUpperCase();
       if (lastWord === 'REDDY') {
@@ -351,162 +928,149 @@ function extractCity(line) {
         if (words.length > 1 && words[words.length - 2].toUpperCase() === 'RANGA') {
           return 'RANGAREDDY';
         }
-        return 'SANGA REDDY'; // Fallback for REDDY
+        return 'SANGA REDDY';
       }
       return normalizeCity(words[words.length - 1]);
     }
   }
-  
-  // 3. Absolute fallback: search the entire line for known cities
-  for (const kc of knownCities) {
-    if (new RegExp(`\\b${kc}\\b`, 'i').test(line)) {
-      return kc;
-    }
-  }
+
   return '';
 }
 
 function extractPhoneNumber(lineText) {
-  function getClean10Digits(cand) {
-    if (!cand) return null;
-    let cleaned = cand
-      .replace(/[Il|]/g, '1')
-      .replace(/[O]/g, '0')
-      .replace(/[§SsbB]/g, (char) => {
-        if (char === '§' || char === 'S' || char === 's' || char === 'B') return '8';
-        if (char === 'b') return '6';
-        return char;
-      });
+  if (!lineText) return '';
+  const cleanLine = lineText.toUpperCase();
+  
+  // Find sequences of digits/normalizable chars that look like phone numbers
+  const candRegex = /[0-9OolIL|tTS§sbB\s\-\(\)\+]{7,22}/g;
+  const matches = cleanLine.match(candRegex) || [];
+  
+  const phoneCandidates = [];
+  for (const rawCand of matches) {
+    const cleaned = normalizeOcrDigits(rawCand);
     const digits = cleaned.replace(/\D/g, '');
     if (digits.length >= 10) {
-      return digits.slice(-10);
-    }
-    return null;
-  }
-
-  // 1. Try to extract from MOBILE (highest priority)
-  let extracted = '';
-  const mobileMatch = lineText.match(/(?:MOBILE|M0B1LE|M0BILE|MOB)[\s:|\-]*([+\d\-\(\)\s§SsbB]{7,20})/i);
-  if (mobileMatch) {
-    extracted = getClean10Digits(mobileMatch[1]) || '';
-  }
-
-  // 2. Try to extract from PHONE if MOBILE is empty
-  if (!extracted) {
-    const phoneMatch = lineText.match(/(?:PHONE|PH0NE|PH)[\s:|\-]*([+\d\-\(\)\s§SsbB]{7,20})/i);
-    if (phoneMatch) {
-      extracted = getClean10Digits(phoneMatch[1]) || '';
-    }
-  }
-
-  // 3. Fallback: search the entire text for any 10-digit number starting with 6,7,8,9
-  if (!extracted) {
-    const cleanedText = lineText
-      .replace(/[Il|]/g, '1')
-      .replace(/[O]/g, '0')
-      .replace(/[§SsbB]/g, (char) => {
-        if (char === '§' || char === 'S' || char === 's' || char === 'B') return '8';
-        if (char === 'b') return '6';
-        return char;
-      });
-    const fallbackMatch = cleanedText.match(/\b([6789]\d{9})\b/);
-    if (fallbackMatch) {
-      extracted = fallbackMatch[1];
-    }
-  }
-
-  // 4. Zero-starting Mobile Number Correction using evidence search
-  if (extracted && extracted.startsWith('0')) {
-    const cleanedText = lineText
-      .replace(/[Il|]/g, '1')
-      .replace(/[O]/g, '0')
-      .replace(/[§SsbB]/g, (char) => {
-        if (char === '§' || char === 'S' || char === 's' || char === 'B') return '8';
-        if (char === 'b') return '6';
-        return char;
-      });
-    
-    // Find all valid 10-digit Indian numbers in the cleaned text (starting with 6-9)
-    const allValidNumbers = cleanedText.match(/\b[6-9]\d{9}\b/g) || [];
-    const suffix = extracted.slice(1);
-    const temp9 = '9' + suffix;
-    
-    // Search for a matching 10-digit number in the text that starts with 6-9 and matches suffix similarity
-    let foundBetter = false;
-    for (const match of allValidNumbers) {
-      let common = 0;
-      for (let i = 0; i < 10; i++) {
-        if (match[i] === temp9[i]) common++;
-      }
-      if (common >= 8) {
-        extracted = temp9;
-        foundBetter = true;
-        break;
+      const phone10 = digits.slice(-10);
+      if (/^[6-9]\d{9}$/.test(phone10)) {
+        phoneCandidates.push(phone10);
       }
     }
-    // "Never blindly change 0 to 9 without evidence." -> If no valid 6-9 starting number is found,
-    // we keep the extracted value (and validation will mark it as Needs Review).
   }
 
-  return extracted;
-}
-
-function cleanAmount(cand) {
-  if (!cand) return '';
-  let cleaned = cand.trim().toUpperCase();
-
-  // Handle specific known corrupted OCR amount strings
-  if (cleaned.includes('TOOOOO')) return '100000';
-  if (cleaned.includes('TASE000')) return '1500000';
-  if (cleaned.includes('TOSO')) return '1000000';
-  if (cleaned.includes('SO000')) return '50000';
-
-  let replaced = cleaned
-    .replace(/\{/g, '1')
-    .replace(/\}/g, '0')
-    .replace(/[oO]/g, '0')
-    .replace(/[iIl|]/g, '1')
-    .replace(/[tT]/g, '1')
-    .replace(/[sS]/g, '5')
-    .replace(/[zZ]/g, '2')
-    .replace(/[gGqQ]/g, '9')
-    .replace(/[bB]/g, '8');
-
-  const digits = replaced.replace(/\D/g, '');
-  return digits;
-}
-
-function extractAmountFromRightText(rightText, pincode, phoneNumber) {
-  if (!rightText) return '';
-  
-  // Replace RS/₹ symbols with space first
-  let cleanedText = rightText.toUpperCase().replace(/RS/g, ' ').replace(/₹/g, ' ');
-  let cleanedEnd = cleanedText.trim().replace(/[\s|~_\.\*\[\]\:\-]+$/, '');
-  
-  // Split strictly by non-alphanumeric characters to keep words like Toso, Tase000 whole
-  const tokens = cleanedEnd.split(/[^A-Z0-9]+/).filter(t => t.length > 0);
-  
-  const cleanPhone = phoneNumber ? phoneNumber.replace(/\D/g, '') : '';
-  const cleanPin = pincode ? pincode.replace(/\D/g, '') : '';
-  
-  // Scan from right to left
-  for (let i = tokens.length - 1; i >= 0; i--) {
-    const rawToken = tokens[i];
-    const cleanedDigits = cleanAmount(rawToken);
-    
-    if (!cleanedDigits) continue;
-    
-    // Ignore if it's equal to phone or pincode or common local STD codes
-    if (cleanPhone && cleanedDigits === cleanPhone) continue;
-    if (cleanPin && cleanedDigits === cleanPin) continue;
-    if (cleanedDigits === '022' || cleanedDigits === '22' || cleanedDigits === '080' || cleanedDigits === '80') continue;
-    
-    // An amount must be at least 4 digits
-    if (cleanedDigits.length < 4) continue;
-    
-    return cleanedDigits;
+  // Extract pincode to ignore
+  let pincode = '';
+  const pinMatch = lineText.match(/(?:PINCODE|P1NC0DE|PIN\s+CODE)?\s*\b(\d{6})\b/i);
+  if (pinMatch) {
+    pincode = pinMatch[1];
   }
+
+  // Filter candidates
+  const validCandidates = phoneCandidates.filter(cand => {
+    if (pincode && cand.includes(pincode)) return false;
+    return true;
+  });
+
+  if (validCandidates.length > 0) {
+    let bestPhone = validCandidates[0];
+    let minDistance = 999;
+    const keywords = ['MOBILE', 'PHONE', 'MOB', 'PH', 'M0B1LE', 'M0BILE', 'PH0NE'];
+    for (const kw of keywords) {
+      const kwIdx = cleanLine.indexOf(kw);
+      if (kwIdx !== -1) {
+        for (const cand of validCandidates) {
+          const candIdx = cleanLine.indexOf(cand);
+          if (candIdx !== -1) {
+            const dist = Math.abs(candIdx - kwIdx);
+            if (dist < minDistance) {
+              minDistance = dist;
+              bestPhone = cand;
+            }
+          }
+        }
+      }
+    }
+    return bestPhone;
+  }
+
+  return '';
+}
+
+// Improved Amount Extraction Logic
+function extractAmount(text, extractedPhone = '') {
+  if (!text) return '';
+  const upperText = text.toUpperCase();
+
+  // Extract pincode to ignore
+  let pincode = '';
+  const pinMatch = text.match(/(?:PINCODE|P1NC0DE|PIN\s+CODE)?\s*\b(\d{6})\b/i);
+  if (pinMatch) {
+    pincode = pinMatch[1];
+  }
+
+  // Extract dates to ignore
+  const dateMatches = text.match(/\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b/g) || [];
+  const dateNumbers = dateMatches.map(d => d.replace(/\D/g, ''));
+
+  // Normalize currency labels and format
+  const cleanText = text
+    .replace(/[₹]/g, ' RS ')
+    .replace(/RS\./gi, ' RS ')
+    .replace(/RS/gi, ' RS ')
+    .toUpperCase();
+
+  // Match standard numbers with optional commas and decimals
+  const numRegex = /\b\d{1,3}(?:,\d{2,3})*(?:\.\d{2})?\b|\b\d{4,9}\b/g;
+  const matches = cleanText.match(numRegex) || [];
   
+  const candidates = [];
+  for (const match of matches) {
+    const rawVal = match.trim();
+    let cleanVal = rawVal.replace(/,/g, '');
+    if (cleanVal.includes('.')) {
+      cleanVal = cleanVal.split('.')[0];
+    }
+    
+    cleanVal = normalizeOcrDigits(cleanVal).replace(/\D/g, '');
+    const numValue = parseFloat(cleanVal);
+    
+    if (isNaN(numValue) || numValue < 1000) continue;
+
+    // Filter exclusions
+    if (pincode && cleanVal === pincode) continue;
+    if (extractedPhone && cleanVal === extractedPhone) continue;
+    if (dateNumbers.some(d => d.includes(cleanVal) || cleanVal.includes(d))) continue;
+    if (cleanVal.length === 10 && /^[6-9]/.test(cleanVal)) continue;
+
+    // Heuristics scoring
+    const idx = cleanText.indexOf(rawVal);
+    let score = 0;
+    
+    if (idx !== -1) {
+      const surroundingText = cleanText.substring(Math.max(0, idx - 30), Math.min(cleanText.length, idx + rawVal.length + 30));
+      if (/RS|₹|AMT|AMOUNT|LOAN|SALARY|EMI|BALANCE|DISBURSAL|SANCTION/i.test(surroundingText)) {
+        score += 100;
+      }
+      const relativePos = idx / cleanText.length;
+      score += relativePos * 50;
+    }
+
+    candidates.push({
+      amount: cleanVal,
+      value: numValue,
+      score: score
+    });
+  }
+
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+      return b.value - a.value;
+    });
+    return candidates[0].amount;
+  }
+
   return '';
 }
 
@@ -526,33 +1090,9 @@ function parseExtractedText(rawText, pageNumber = 1, sourceFileName = 'UploadedS
 
   for (const rowText of candidateLines) {
     const cleanRowText = rowText.replace(/\s{2,}/g, ' ').trim();
-    let pincode = '';
-    const pinMatch = cleanRowText.match(/PINCODE[\s:]*(\d{6})/i);
-    if (pinMatch) {
-      pincode = pinMatch[1];
-    }
     const city = extractCity(cleanRowText);
     const phoneNumber = extractPhoneNumber(cleanRowText);
-    
-    // Fallback amount parsing
-    let amount = '';
-    let cleanedText = cleanRowText.toUpperCase().replace(/RS/g, ' ').replace(/₹/g, ' ');
-    let cleanedEnd = cleanedText.trim().replace(/[\s|~_\.\*\[\]\:\-]+$/, '');
-    const tokens = cleanedEnd.split(/[^A-Z0-9]+/).filter(t => t.length > 0);
-    const cleanPhone = phoneNumber ? phoneNumber.replace(/\D/g, '') : '';
-    const cleanPin = pincode ? pincode.replace(/\D/g, '') : '';
-    
-    for (let i = tokens.length - 1; i >= 0; i--) {
-      const rawToken = tokens[i];
-      const cleanedDigits = cleanAmount(rawToken);
-      if (!cleanedDigits) continue;
-      if (cleanPhone && cleanedDigits === cleanPhone) continue;
-      if (cleanPin && cleanedDigits === cleanPin) continue;
-      if (cleanedDigits === '022' || cleanedDigits === '22' || cleanedDigits === '080' || cleanedDigits === '80') continue;
-      if (cleanedDigits.length < 4) continue;
-      amount = cleanedDigits;
-      break;
-    }
+    const amount = extractAmount(cleanRowText, phoneNumber);
     
     let confidence = 100;
     const reviewReasons = [];
@@ -599,20 +1139,13 @@ function parseExtractedText(rawText, pageNumber = 1, sourceFileName = 'UploadedS
     
     const numericAmount = parseFloat(finalAmount);
     const resolvedAmount = !isNaN(numericAmount) ? numericAmount : finalAmount;
-    const isOk = 
-      finalCity !== 'Needs Review' &&
-      finalPhone !== 'Needs Entry' &&
-      isValidIndianPhone &&
-      isValidAmount &&
-      !isPhoneEqualAmount &&
-      !isSuspiciousAmount &&
-      reviewReasons.length === 0;
+    const isOk = reviewReasons.length === 0;
 
     results.push({
       pageNumber,
       pageNo: pageNumber,
       rowNumber: rowCounter,
-      sNo: rowCounter++,
+      sNo: rowCounter,
       city: finalCity,
       phoneNumber: finalPhone,
       amount: resolvedAmount,
@@ -624,6 +1157,7 @@ function parseExtractedText(rawText, pageNumber = 1, sourceFileName = 'UploadedS
       reviewReason: reviewReasons.join(' • '),
       sourceFileName
     });
+    rowCounter++;
   }
   
   return {
@@ -633,7 +1167,7 @@ function parseExtractedText(rawText, pageNumber = 1, sourceFileName = 'UploadedS
   };
 }
 
-// Layout coordinate-aware parsing logic
+// Layout coordinate-aware parsing logic with Y-coordinate grouping
 function parseExtractedTextWithLayout(rawText, blocks, pageNumber = 1, sourceFileName = 'UploadedScan', cropData = {}, corrections = []) {
   const lines = [];
   if (blocks && Array.isArray(blocks)) {
@@ -656,153 +1190,126 @@ function parseExtractedTextWithLayout(rawText, blocks, pageNumber = 1, sourceFil
     return parseExtractedText(rawText, pageNumber, sourceFileName);
   }
 
-  const candidateLines = [];
-  for (const line of lines) {
-    let cleanText = line.text || '';
-    cleanText = cleanText
-      .replace(/P1NC0DE/i, 'PINCODE')
-      .replace(/PIN\s+CODE/i, 'PINCODE')
-      .replace(/PH0NE/i, 'PHONE')
-      .replace(/M0B1LE/i, 'MOBILE')
-      .replace(/M0BILE/i, 'MOBILE');
-
-    if (/PINCODE/i.test(cleanText)) {
-      candidateLines.push({
-        ...line,
-        cleanText
-      });
-    }
-  }
-
-  // 1. Determine maximum horizontal coordinate (maxX) and maxY
+  // Determine maximum dimensions
   let maxX = 0;
   let maxY = 0;
   for (const line of lines) {
     if (line.bbox) {
-      if (line.bbox.x1 > maxX) {
-        maxX = line.bbox.x1;
-      }
-      if (line.bbox.y1 > maxY) {
-        maxY = line.bbox.y1;
-      }
+      if (line.bbox.x1 > maxX) maxX = line.bbox.x1;
+      if (line.bbox.y1 > maxY) maxY = line.bbox.y1;
     }
   }
   if (maxX === 0) maxX = MIN_WIDTH;
   if (maxY === 0) maxY = 4000;
 
-  // 2. Identify the starting coordinates of the rightmost numeric amount values on the page
-  const rightmostX0s = [];
-  for (const line of candidateLines) {
-    const words = line.words || [];
-    for (let i = words.length - 1; i >= 0; i--) {
-      const w = words[i];
-      const text = w.text || '';
-      const cleanWord = text.replace(/[^a-zA-Z0-9]/g, '');
-      const hasDigits = /[0-9]/.test(text) || /Tooooo/i.test(text) || /Tase000/i.test(text) || /Toso/i.test(text);
+  // Group lines based on vertical overlap (Y-coordinate proximity)
+  const sortedLines = [...lines].filter(l => l.bbox).sort((a, b) => a.bbox.y0 - b.bbox.y0);
+  const groupedRows = [];
+  for (const line of sortedLines) {
+    const y0 = line.bbox.y0;
+    const y1 = line.bbox.y1;
+    const height = y1 - y0;
+    if (height <= 0) continue;
 
-      if (hasDigits && cleanWord.length >= 3) {
-        // Amount column is on the far right. Restrict coordinates search to rightmost 20% of the page
-        if (w.bbox && w.bbox.x0 > 0.80 * maxX) {
-          rightmostX0s.push(w.bbox.x0);
-          break; // Found the rightmost token for this line
-        }
+    let matchedGroup = null;
+    for (const group of groupedRows) {
+      const overlap = Math.min(group.bbox.y1, y1) - Math.max(group.bbox.y0, y0);
+      const minH = Math.min(group.bbox.y1 - group.bbox.y0, y1 - y0);
+      // Group lines sharing at least 45% of vertical height
+      if (overlap > 0 && (overlap / minH) >= 0.45) {
+        matchedGroup = group;
+        break;
       }
+    }
+
+    if (matchedGroup) {
+      matchedGroup.lines.push(line);
+      matchedGroup.bbox.y0 = Math.min(matchedGroup.bbox.y0, y0);
+      matchedGroup.bbox.y1 = Math.max(matchedGroup.bbox.y1, y1);
+    } else {
+      groupedRows.push({
+        bbox: { y0, y1 },
+        lines: [line]
+      });
     }
   }
 
-  // 3. Compute amount column boundary start X (amountColStart)
-  let amountColStart = Math.round(0.825 * maxX);
-  if (rightmostX0s.length > 0) {
-    const sorted = rightmostX0s.sort((a, b) => a - b);
-    const minX0 = sorted[0];
-    // Restrict column start to a safe range [80% width, 83% width] to prevent encroachment on phone numbers
-    amountColStart = Math.max(Math.round(0.80 * maxX), Math.min(Math.round(0.83 * maxX), minX0 - 10));
+  // Reconstruct row candidates from groups, splitting if multi-column
+  const candidateGroups = [];
+  for (const group of groupedRows) {
+    const allWords = [];
+    for (const line of group.lines) {
+      if (line.words) {
+        allWords.push(...line.words);
+      }
+    }
+    // Sort words horizontally left-to-right
+    allWords.sort((a, b) => (a.bbox?.x0 ?? 0) - (b.bbox?.x0 ?? 0));
+    
+    const tempGroup = {
+      bbox: group.bbox,
+      words: allWords
+    };
+
+    const splitGroups = splitMultiColumnGroup(tempGroup);
+    for (const sg of splitGroups) {
+      if (/PINCODE/i.test(sg.text)) {
+        candidateGroups.push(sg);
+      }
+    }
   }
-  console.log(`[OCR Debug] Page ${pageNumber}: width = ${maxX}, height = ${maxY}, Amount column starts at X = ${amountColStart}`);
 
   const results = [];
   let rowCounter = 1;
 
-  for (const line of candidateLines) {
-    const words = line.words || [];
-    const leftWords = [];
-    const rightWords = [];
-
-    // Separate words based on X coordinate threshold
-    for (const w of words) {
-      if (w.bbox && w.bbox.x0 >= amountColStart) {
-        rightWords.push(w);
-      } else {
-        leftWords.push(w);
-      }
-    }
-
-    const leftText = leftWords.map(w => w.text).join(' ').trim();
-    const rightText = rightWords.map(w => w.text).join(' ').trim();
-
-    const cleanLeftText = leftText
+  for (const group of candidateGroups) {
+    const cleanText = group.text
       .replace(/P1NC0DE/i, 'PINCODE')
       .replace(/PIN\s+CODE/i, 'PINCODE')
       .replace(/PH0NE/i, 'PHONE')
       .replace(/M0B1LE/i, 'MOBILE')
       .replace(/M0BILE/i, 'MOBILE');
 
-    let pincode = '';
-    const pinMatch = cleanLeftText.match(/PINCODE[\s:]*(\d{6})/i);
-    if (pinMatch) {
-      pincode = pinMatch[1];
-    }
-
-    const city = extractCity(cleanLeftText);
-    const phoneNumberStandard = extractPhoneNumber(cleanLeftText);
-    const phoneConfidenceStandard = getFieldConfidence(phoneNumberStandard, leftWords, 'phone');
-    const isPhoneStandardInvalid = !phoneNumberStandard || !/^[6-9]\d{9}$/.test(phoneNumberStandard);
-
-    let phoneNumber = phoneNumberStandard;
+    const city = extractCity(cleanText);
+    
+    // Extract phone numbers using extractAllPhoneNumbers
+    const phoneResultStandard = extractAllPhoneNumbers(cleanText);
+    let phoneNumber = phoneResultStandard.best;
+    let otherPhones = phoneResultStandard.others;
     let phoneSource = 'standard';
     let phoneCropConf = null;
 
-    if (isPhoneStandardInvalid) {
-      if (cropData.phoneCropBlocks) {
-        const croppedPhoneRes = findCropPhoneForLine(line, cropData.phoneCropBlocks);
-        if (croppedPhoneRes) {
-          phoneNumber = croppedPhoneRes.phone;
-          phoneSource = 'crop';
-          phoneCropConf = croppedPhoneRes.confidence;
+    const isPhoneStandardInvalid = !phoneNumber || !/^[6-9]\d{9}$/.test(phoneNumber);
+    if (isPhoneStandardInvalid && cropData.phoneCropBlocks) {
+      const croppedPhoneRes = findCropPhoneForGroup(group, cropData.phoneCropBlocks);
+      if (croppedPhoneRes) {
+        phoneNumber = croppedPhoneRes.phone;
+        phoneSource = 'crop';
+        phoneCropConf = croppedPhoneRes.confidence;
+        if (phoneResultStandard.best && phoneResultStandard.best !== phoneNumber && !otherPhones.includes(phoneResultStandard.best)) {
+          otherPhones.push(phoneResultStandard.best);
         }
       }
     }
 
-    let amountStandard = extractAmountFromRightText(rightText, pincode, phoneNumber);
-    const amountConfidenceStandard = getFieldConfidence(amountStandard, rightWords, 'amount');
-    const numericAmountValStandard = parseFloat(amountStandard);
-    const isValidAmountStandard = !isNaN(numericAmountValStandard) && numericAmountValStandard >= 10000;
-    const isPhoneEqualAmountStandard = phoneNumber && amountStandard && phoneNumber.replace(/\D/g, '') === amountStandard.replace(/\D/g, '');
-    const looksLikePhoneStandard = amountStandard && /^[6-9]\d{9}$/.test(amountStandard);
-    const isSuspiciousAmountStandard = amountStandard && (amountStandard.length >= 10 || looksLikePhoneStandard || (amountStandard.length >= 8 && amountStandard.startsWith('1')));
-
-    const isAmountStandardInvalid = !amountStandard || isNaN(numericAmountValStandard) || numericAmountValStandard === 0 || !isValidAmountStandard;
-    const isAmountStandardSuspicious = isPhoneEqualAmountStandard || isSuspiciousAmountStandard;
-
+    const amountStandard = extractAmount(cleanText, phoneNumber);
     let amount = amountStandard;
     let amountSource = 'standard';
     let amountCropConf = null;
 
     if (cropData.amountCropBlocks) {
-      const croppedAmountRes = findCropAmountForLine(line, cropData.amountCropBlocks);
+      const croppedAmountRes = findCropAmountForGroup(group, cropData.amountCropBlocks);
       if (croppedAmountRes) {
         const cropVal = croppedAmountRes.amount;
         const cropConf = croppedAmountRes.confidence;
-        const isStandardPhone = isPhoneEqualAmountStandard || looksLikePhoneStandard;
+        const isStandardPhone = phoneNumber && amountStandard && phoneNumber.replace(/\D/g, '') === amountStandard.replace(/\D/g, '');
+        const looksLikePhoneStandard = amountStandard && /^[6-9]\d{9}$/.test(amountStandard);
 
-        // Override Rule 1: Standard amount is a phone/mobile -> always override with crop if crop is present
-        if (isStandardPhone && cropVal) {
+        if ((isStandardPhone || looksLikePhoneStandard) && cropVal) {
           amount = cropVal;
           amountSource = 'crop';
           amountCropConf = cropConf;
-        }
-        // Override Rule 2: Standard is invalid/suspicious, crop is valid, and crop confidence is decent (>= 40)
-        else if ((isAmountStandardInvalid || isAmountStandardSuspicious) && cropVal && cropConf >= 40) {
+        } else if ((!amountStandard || parseFloat(amountStandard) === 0 || parseFloat(amountStandard) < 10000) && cropVal && cropConf >= 40) {
           amount = cropVal;
           amountSource = 'crop';
           amountCropConf = cropConf;
@@ -810,16 +1317,12 @@ function parseExtractedTextWithLayout(rawText, blocks, pageNumber = 1, sourceFil
       }
     }
 
-    if (!amount) {
-      amount = amountStandard;
-    }
-
     const reviewReasons = [];
 
-    // Calculate OCR field confidences
-    const cityConfidence = getFieldConfidence(city, leftWords, 'city');
-    const phoneConfidence = phoneSource === 'crop' ? phoneCropConf : getFieldConfidence(phoneNumber, leftWords, 'phone');
-    const amountConfidence = amountSource === 'crop' ? amountCropConf : getFieldConfidence(amount, rightWords, 'amount');
+    // Confidence calculations
+    const cityConfidence = getFieldConfidence(city, group.words, 'city');
+    const phoneConfidence = phoneSource === 'crop' ? phoneCropConf : getFieldConfidence(phoneNumber, group.words, 'phone');
+    const amountConfidence = amountSource === 'crop' ? amountCropConf : getFieldConfidence(amount, group.words, 'amount');
     const overallConfidence = Math.round((cityConfidence + phoneConfidence + amountConfidence) / 3);
 
     let finalCity = city;
@@ -840,60 +1343,81 @@ function parseExtractedTextWithLayout(rawText, blocks, pageNumber = 1, sourceFil
     let finalAmount = amount;
     const numericAmountVal = parseFloat(amount);
     const isValidAmount = !isNaN(numericAmountVal) && numericAmountVal >= 10000;
-
     const isPhoneEqualAmount = phoneNumber && amount && phoneNumber.replace(/\D/g, '') === amount.replace(/\D/g, '');
     const looksLikePhone = amount && /^[6-9]\d{9}$/.test(amount);
     const isSuspiciousAmount = amount && (amount.length >= 10 || looksLikePhone || (amount.length >= 8 && amount.startsWith('1')));
 
+    // Determine row status (OK, Source Truncated / Missing Amount, Low OCR Confidence, Needs Review)
+    let status = 'OK';
+
     if (!amount || isNaN(numericAmountVal) || numericAmountVal === 0) {
-      reviewReasons.push('Amount doubtful or missing');
+      status = 'Source Truncated / Missing Amount';
+      reviewReasons.push(cropData.isTruncated ? 'Amount missing due to truncated page scan' : 'Amount doubtful or missing');
       finalAmount = '0';
     } else if (isPhoneEqualAmount) {
+      status = 'Needs Review';
       reviewReasons.push('Amount should not equal phone/mobile');
     } else if (isSuspiciousAmount) {
+      status = 'Needs Review';
       reviewReasons.push('Suspicious extra leading digit amount');
     } else if (!isValidAmount) {
+      status = 'Needs Review';
       reviewReasons.push('Amount must be at least 10,000');
+    }
+
+    // Demote to Needs Review if city or phone is missing/invalid
+    if (status === 'OK') {
+      if (!city || city.length < 2 || !phoneNumber || !isValidIndianPhone) {
+        status = 'Needs Review';
+      }
+    }
+
+    // Demote to Low OCR Confidence if overall confidence is under 60
+    if (status === 'OK' && overallConfidence < 60) {
+      status = 'Low OCR Confidence';
+      reviewReasons.push('Low OCR extraction confidence');
+    } else if (status === 'Needs Review' && overallConfidence < 60) {
+      status = 'Low OCR Confidence';
+      reviewReasons.push('Low OCR extraction confidence');
     }
 
     const numericAmount = parseFloat(finalAmount);
     const resolvedAmount = !isNaN(numericAmount) ? numericAmount : finalAmount;
-
-    const isOk = reviewReasons.length === 0;
+    const isOk = status === 'OK';
 
     const rowObj = {
       pageNumber,
       pageNo: pageNumber,
       rowNumber: rowCounter,
-      sNo: rowCounter++,
+      sNo: rowCounter,
       city: finalCity,
       phoneNumber: finalPhone,
       amount: resolvedAmount,
-      originalText: line.text,
-      originalOcrText: line.text,
+      originalText: group.text,
+      originalOcrText: group.text,
       cityConfidence,
       phoneConfidence,
       amountConfidence,
       confidence: overallConfidence,
       needsReview: !isOk,
-      status: isOk ? 'OK' : 'Needs Review',
+      status: status,
       reviewReason: reviewReasons.join(' • '),
-      sourceFileName
+      sourceFileName,
+      otherPhoneCandidates: otherPhones
     };
 
-    // Apply manual corrections suggests
-    applyManualCorrections(rowObj, line.text, corrections);
-
+    applyManualCorrections(rowObj, group.text, corrections);
     results.push(rowObj);
+    rowCounter++;
   }
 
-  // Duplicate detection page-wise
+  // Duplicate checks page-wise
   const phoneAmountMap = {};
   for (const row of results) {
     const phone = (row.phoneNumber || '').replace(/\D/g, '');
-    const amount = (row.amount || '').toString().replace(/\D/g, '');
-    if (phone && amount) {
-      const key = `${phone}_${amount}`;
+    const amt = (row.amount || '').toString().replace(/\D/g, '');
+    if (phone && amt) {
+      const key = `${phone}_${amt}`;
       if (!phoneAmountMap[key]) {
         phoneAmountMap[key] = [];
       }
@@ -913,16 +1437,14 @@ function parseExtractedTextWithLayout(rawText, blocks, pageNumber = 1, sourceFil
   }
 
   const rawLines = lines.map(line => line.text);
-  const candidateLinesText = candidateLines.map(line => line.text);
+  const candidateLinesText = candidateGroups.map(g => g.text);
 
   return {
     rawLines,
     candidateLines: candidateLinesText,
     extractedRows: results
   };
-}
-
-export async function processFileForOcr(fileBuffer, mimeType, fileName) {
+}export async function processFileForOcr(fileBuffer, mimeType, fileName, onProgress) {
   let allRows = [];
   let pageCount = 0;
   const debugData = [];
@@ -932,614 +1454,228 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
   try {
     if (mimeType.startsWith('image/')) {
       pageCount = 1;
-      const metadata = await sharp(fileBuffer).metadata();
-      const width = metadata.width || 0;
-      const height = metadata.height || 0;
-      
-      let scale = 1;
-      if (width < MIN_WIDTH) {
-        scale = Math.ceil(MIN_WIDTH / width);
-      }
-      
-      let sharpPipeline = sharp(fileBuffer);
-      if (scale > 1) {
-        sharpPipeline = sharpPipeline.resize({
-          width: width * scale,
-          height: height * scale,
-          kernel: sharp.kernel.lanczos3
+      if (typeof onProgress === 'function') {
+        onProgress({
+          currentPage: 0,
+          totalPages: 1,
+          message: 'Image processing started'
         });
       }
 
-      const channels = metadata.channels || 3;
-      
-      // Pass A (standard grayscale + sharpen)
-      const optimizedPageBufferA = await sharpPipeline
-        .trim({ background: '#ffffff', threshold: 15 })
-        .greyscale()
-        .normalize()
-        .sharpen()
-        .png()
-        .toBuffer();
-        
-      if (!IS_PROD) {
-        const debugDir = path.join(process.cwd(), 'debug_pages');
-        if (!fs.existsSync(debugDir)) {
-          fs.mkdirSync(debugDir, { recursive: true });
+      // Detect truncation on direct image upload
+      let isTruncated = false;
+      try {
+        const meta = await sharp(fileBuffer).metadata();
+        const width = meta.width || 1200;
+        const height = meta.height || 1600;
+        const aspect = height / width;
+        // Heuristic: if very narrow, it might be truncated
+        if (aspect > 1.45) {
+          isTruncated = true;
         }
-        try {
-          fs.writeFileSync(path.join(debugDir, 'page-1.png'), optimizedPageBufferA);
-        } catch (e) {
-          console.error('Failed to write debug page image:', e);
-        }
-      }
-      
-      const retA = await worker.recognize(optimizedPageBufferA, {}, { blocks: true });
-      const pageResultA = parseExtractedTextWithLayout(retA.data.text, retA.data.blocks, 1, fileName, {}, corrections);
-      
-      const avgConfA = pageResultA.extractedRows.length > 0
-        ? pageResultA.extractedRows.reduce((sum, r) => sum + r.confidence, 0) / pageResultA.extractedRows.length
-        : 0;
-
-      let bestVariant = 'A';
-      let bestRows = pageResultA.extractedRows;
-      let bestOcrText = retA.data.text;
-      let bestBlocks = retA.data.blocks;
-      let bestBuffer = optimizedPageBufferA;
-
-      const isStandardPassWeak = pageResultA.extractedRows.length < 5 || avgConfA < 70;
-
-      if (isStandardPassWeak && pageResultA.extractedRows.length > 0) {
-        console.log(`[OCR Debug] Standard pass for image is weak (rows: ${pageResultA.extractedRows.length}, avgConf: ${avgConfA}%). Running multi-pass preprocessing...`);
-
-        // Pass B: Threshold
-        try {
-          const sharpPipelineB = sharp(fileBuffer);
-          const optimizedPageBufferB = await sharpPipelineB
-            .trim({ background: '#ffffff', threshold: 15 })
-            .greyscale()
-            .threshold(160)
-            .png()
-            .toBuffer();
-
-          const retB = await worker.recognize(optimizedPageBufferB, {}, { blocks: true });
-          const pageResultB = parseExtractedTextWithLayout(retB.data.text, retB.data.blocks, 1, fileName, {}, corrections);
-          const avgConfB = pageResultB.extractedRows.length > 0
-            ? pageResultB.extractedRows.reduce((sum, r) => sum + r.confidence, 0) / pageResultB.extractedRows.length
-            : 0;
-
-          if (pageResultB.extractedRows.length > bestRows.length || (pageResultB.extractedRows.length === bestRows.length && avgConfB > avgConfA)) {
-            bestVariant = 'B';
-            bestRows = pageResultB.extractedRows;
-            bestOcrText = retB.data.text;
-            bestBlocks = retB.data.blocks;
-            bestBuffer = optimizedPageBufferB;
-          }
-        } catch (errB) {
-          console.error("Error in image preprocessing pass B:", errB);
-        }
-
-        // Pass C: Enlarged 2x
-        try {
-          const sharpPipelineC = sharp(fileBuffer);
-          const optimizedPageBufferC = await sharpPipelineC
-            .trim({ background: '#ffffff', threshold: 15 })
-            .resize({ width: width * 2, height: height * 2, kernel: sharp.kernel.lanczos3 })
-            .greyscale()
-            .sharpen()
-            .png()
-            .toBuffer();
-
-          const retC = await worker.recognize(optimizedPageBufferC, {}, { blocks: true });
-          const pageResultC = parseExtractedTextWithLayout(retC.data.text, retC.data.blocks, 1, fileName, {}, corrections);
-          const avgConfC = pageResultC.extractedRows.length > 0
-            ? pageResultC.extractedRows.reduce((sum, r) => sum + r.confidence, 0) / pageResultC.extractedRows.length
-            : 0;
-
-          const currentBestLen = bestRows.length;
-          const currentBestConf = bestRows.reduce((sum, r) => sum + r.confidence, 0) / (bestRows.length || 1);
-
-          if (pageResultC.extractedRows.length > currentBestLen || (pageResultC.extractedRows.length === currentBestLen && avgConfC > currentBestConf)) {
-            bestVariant = 'C';
-            bestRows = pageResultC.extractedRows;
-            bestOcrText = retC.data.text;
-            bestBlocks = retC.data.blocks;
-            bestBuffer = optimizedPageBufferC;
-          }
-        } catch (errC) {
-          console.error("Error in image preprocessing pass C:", errC);
-        }
-        console.log(`[OCR Debug] Selected best image preprocessing variant: ${bestVariant}`);
+      } catch (e) {
+        console.warn("Failed to check image metadata for truncation:", e);
       }
 
-      // Check if secondary crop OCR is needed
-      let needsSecondaryCrop = false;
-      for (const row of bestRows) {
-        const hasLowConf = row.cityConfidence < 70 || row.phoneConfidence < 70 || row.amountConfidence < 70;
-        const hasInvalidPhone = !row.phoneNumber || !/^[6-9]\d{9}$/.test(row.phoneNumber);
-        const hasSuspiciousAmount = !row.amount || parseFloat(row.amount) === 0 || row.amount.toString().length >= 10 || 
-                                    (row.amount.toString().length >= 8 && row.amount.toString().startsWith('1')) ||
-                                    row.phoneNumber === row.amount.toString() ||
-                                    row.needsReview || row.status === 'Needs Review';
-        
-        if (hasLowConf || hasInvalidPhone || hasSuspiciousAmount) {
-          needsSecondaryCrop = true;
-          break;
-        }
-      }
+      const pageRes = await processPageImage(fileBuffer, null, 1, fileName, isTruncated, corrections, worker);
+      allRows.push(...pageRes.rows);
 
-      let cropData = {};
-      if (needsSecondaryCrop) {
-        console.log(`[OCR Debug] Image: Identified rows needing correction. Running secondary cropped column OCR passes...`);
-        let maxX = 0;
-        let maxY = 0;
-        if (bestBlocks) {
-          for (const block of bestBlocks) {
-            if (block.paragraphs) {
-              for (const para of block.paragraphs) {
-                if (para.lines) {
-                  for (const line of para.lines) {
-                    if (line.bbox) {
-                      if (line.bbox.x1 > maxX) maxX = line.bbox.x1;
-                      if (line.bbox.y1 > maxY) maxY = line.bbox.y1;
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-        if (maxX === 0) maxX = MIN_WIDTH;
-        if (maxY === 0) maxY = 4000;
-
-        const candidateLines = [];
-        if (bestBlocks) {
-          for (const block of bestBlocks) {
-            if (block.paragraphs) {
-              for (const para of block.paragraphs) {
-                if (para.lines) {
-                  for (const line of para.lines) {
-                    if (/PINCODE/i.test(line.text)) {
-                      candidateLines.push(line);
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        const rightmostX0s = [];
-        let phoneX0s = [];
-        let phoneX1s = [];
-
-        for (const line of candidateLines) {
-          const words = line.words || [];
-          for (let i = words.length - 1; i >= 0; i--) {
-            const w = words[i];
-            const text = w.text || '';
-            const cleanWord = text.replace(/[^a-zA-Z0-9]/g, '');
-            const hasDigits = /[0-9]/.test(text) || /Tooooo/i.test(text) || /Tase000/i.test(text) || /Toso/i.test(text);
-
-            if (hasDigits && cleanWord.length >= 3) {
-              if (w.bbox && w.bbox.x0 > 0.80 * maxX) {
-                rightmostX0s.push(w.bbox.x0);
-                break;
-              }
-            }
-          }
-
-          words.forEach(w => {
-            const text = w.text || '';
-            if (/PHONE|MOBILE|PH|MOB/i.test(text) || (/^[6-9]\d{9}$/.test(text.replace(/\D/g, '')))) {
-              if (w.bbox) {
-                phoneX0s.push(w.bbox.x0);
-                phoneX1s.push(w.bbox.x1);
-              }
-            }
-          });
-        }
-
-        let amountColStart = Math.round(0.825 * maxX);
-        if (rightmostX0s.length > 0) {
-          const sorted = rightmostX0s.sort((a, b) => a - b);
-          const minX0 = sorted[0];
-          amountColStart = Math.max(Math.round(0.80 * maxX), Math.min(Math.round(0.83 * maxX), minX0 - 10));
-        }
-
-        let phoneColStart = Math.round(0.50 * maxX);
-        let phoneColEnd = Math.round(0.80 * maxX);
-        if (phoneX0s.length > 0 && phoneX1s.length > 0) {
-          phoneColStart = Math.max(0, Math.min(...phoneX0s) - 20);
-          phoneColEnd = Math.min(maxX, Math.max(...phoneX1s) + 20);
-        }
-        if (phoneColEnd >= amountColStart) {
-          phoneColEnd = amountColStart - 20;
-        }
-
-        // Secondary Pass: Amount Crop
-        try {
-          let cropLeft = Math.max(0, Math.min(amountColStart + 10, maxX - 10));
-          let cropWidth = Math.max(10, maxX - cropLeft);
-          const amountCropBuffer = await sharp(bestBuffer)
-            .extract({ left: cropLeft, top: 0, width: cropWidth, height: maxY })
-            .toBuffer();
-
-          await worker.setParameters({ tessedit_char_whitelist: '0123456789\n\r ' });
-          const amtCropRet = await worker.recognize(amountCropBuffer, {}, { blocks: true });
-          cropData.amountCropBlocks = amtCropRet.data.blocks;
-        } catch (cropAmtErr) {
-          console.error("Secondary crop amount OCR failure:", cropAmtErr);
-        }
-
-        // Secondary Pass: Phone Crop
-        try {
-          let cropLeft = Math.max(0, phoneColStart);
-          let cropWidth = Math.max(10, phoneColEnd - phoneColStart);
-          const phoneCropBuffer = await sharp(bestBuffer)
-            .extract({ left: cropLeft, top: 0, width: cropWidth, height: maxY })
-            .toBuffer();
-
-          await worker.setParameters({ tessedit_char_whitelist: '0123456789\n\r ' });
-          const phoneCropRet = await worker.recognize(phoneCropBuffer, {}, { blocks: true });
-          cropData.phoneCropBlocks = phoneCropRet.data.blocks;
-        } catch (cropPhoneErr) {
-          console.error("Secondary crop phone OCR failure:", cropPhoneErr);
-        }
-
-        await worker.setParameters({ tessedit_char_whitelist: '' });
-
-        const finalPageResult = parseExtractedTextWithLayout(bestOcrText, bestBlocks, 1, fileName, cropData, corrections);
-        bestRows = finalPageResult.extractedRows;
-      }
-
-      allRows.push(...bestRows);
-      
       debugData.push({
+        inputType: 'image',
         pageNumber: 1,
-        rawText: bestOcrText,
-        rawLines: bestRows.map(r => r.originalText),
-        candidateLines: bestRows.map(r => r.originalText),
-        extractedRows: bestRows
+        ...pageRes.qualityMeta,
+        rawText: pageRes.ocrText,
+        rawLines: pageRes.rows.map(r => r.originalText),
+        candidateLines: pageRes.rows.map(r => r.originalText),
+        extractedRows: pageRes.rows
       });
-      
-      console.log(`[OCR Debug] Processed image 1 / 1`);
-      console.log(`  - OCR text length: ${bestOcrText.length} characters`);
-      console.log(`  - Final extracted rows: ${bestRows.length}`);
-      
+
+      console.log(`[OCR Debug] Processed direct image 1 / 1. Rows: ${pageRes.rows.length}, status: ${pageRes.qualityRating}`);
+
+      if (typeof onProgress === 'function') {
+        onProgress({
+          currentPage: 1,
+          totalPages: 1,
+          message: 'Completed processing image'
+        });
+      }
+
     } else if (mimeType === 'application/pdf') {
       const data = new Uint8Array(fileBuffer);
       const loadingTask = pdfjs.getDocument({ data });
       const pdf = await loadingTask.promise;
       pageCount = pdf.numPages;
-      
+      const pageStats = [];
+      if (typeof onProgress === 'function') {
+        onProgress({
+          currentPage: 0,
+          totalPages: pageCount,
+          message: `PDF loaded. ${pageCount} pages found.`
+        });
+      }
+
       console.log(`[OCR Debug] Starting PDF processing for ${fileName}. Total pages: ${pageCount}`);
-      
+
+      // Query page viewports to find maximum page width for truncation checking
+      let maxPdfPageWidth = 0;
+      const pageViewports = [];
+      for (let p = 1; p <= pageCount; p++) {
+        try {
+          const pg = await pdf.getPage(p);
+          const vp = pg.getViewport({ scale: 1 });
+          pageViewports.push({ p, width: vp.width, height: vp.height });
+          if (vp.width > maxPdfPageWidth) {
+            maxPdfPageWidth = vp.width;
+          }
+          pg.cleanup?.();
+        } catch (vpErr) {
+          console.warn(`[OCR Debug] Failed to get viewport for page ${p}:`, vpErr);
+        }
+      }
+
       for (let p = 1; p <= pageCount; p++) {
         console.log(`[OCR] PDF page ${p} started`);
-        try {
-          const page = await pdf.getPage(p);
-        const opList = await page.getOperatorList();
-        
-        let imgId = null;
-        const OPS = pdfjs.OPS;
-        for (let i = 0; i < opList.fnArray.length; i++) {
-          if (opList.fnArray[i] === OPS.paintImageXObject) {
-            imgId = opList.argsArray[i][0];
-            break;
-          }
-        }
-        
-        if (!imgId) {
-          console.warn(`[OCR Debug] No image object found on page ${p}, skipping.`);
-          continue;
-        }
-        
-        const imgObj = page.objs.get(imgId);
-        if (!imgObj) {
-          console.warn(`[OCR Debug] Image object ${imgId} not resolved on page ${p}, skipping.`);
-          continue;
-        }
-        
-        const channels = imgObj.kind === 3 ? 4 : (imgObj.kind === 2 ? 3 : 1);
-        
-        let scale = 1;
-        if (imgObj.width < MIN_WIDTH) {
-          scale = Math.ceil(MIN_WIDTH / imgObj.width);
-        }
-        
-        let sharpPipeline = sharp(imgObj.data, {
-          raw: {
-            width: imgObj.width,
-            height: imgObj.height,
-            channels: channels
-          }
-        });
-        
-        if (scale > 1) {
-          sharpPipeline = sharpPipeline.resize({
-            width: imgObj.width * scale,
-            height: imgObj.height * scale,
-            kernel: sharp.kernel.lanczos3
+        logMemory(`before page ${p}`);
+        if (typeof onProgress === 'function') {
+          onProgress({
+            currentPage: p,
+            totalPages: pageCount,
+            message: `Processing page ${p} of ${pageCount}`
           });
         }
-        
-        // Pass A (standard grayscale + sharpen)
-        const optimizedPageBufferA = await sharpPipeline
-          .trim({ background: '#ffffff', threshold: 15 })
-          .greyscale()
-          .normalize()
-          .sharpen()
-          .png()
-          .toBuffer();
+
+        let page = null;
+        let opList = null;
+        let imgObj = null;
+
+        try {
+          page = await pdf.getPage(p);
+          opList = await page.getOperatorList();
+
+          let imgId = null;
+          const OPS = pdfjs.OPS;
+          for (let i = 0; i < opList.fnArray.length; i++) {
+            if (opList.fnArray[i] === OPS.paintImageXObject) {
+              imgId = opList.argsArray[i][0];
+              break;
+            }
+          }
+
+          if (!imgId) {
+            console.warn(`[OCR Debug] No image object found on page ${p}, skipping.`);
+            continue;
+          }
+
+          imgObj = page.objs.get(imgId);
+          if (!imgObj) {
+            console.warn(`[OCR Debug] Image object ${imgId} not resolved on page ${p}, skipping.`);
+            continue;
+          }
+
+          const channels = imgObj.kind === 3 ? 4 : (imgObj.kind === 2 ? 3 : 1);
           
-        if (!IS_PROD) {
-          try {
-            const debugDir = path.join(process.cwd(), 'debug_pages');
-            if (!fs.existsSync(debugDir)) {
-              fs.mkdirSync(debugDir, { recursive: true });
-            }
-            fs.writeFileSync(path.join(debugDir, `page-${p}.png`), optimizedPageBufferA);
-          } catch (e) {
-            console.error('Failed to write debug page image:', e);
-          }
-        }
-        
-        const retA = await worker.recognize(optimizedPageBufferA, {}, { blocks: true });
-        const pageResultA = parseExtractedTextWithLayout(retA.data.text, retA.data.blocks, p, fileName, {}, corrections);
-        
-        const avgConfA = pageResultA.extractedRows.length > 0
-          ? pageResultA.extractedRows.reduce((sum, r) => sum + r.confidence, 0) / pageResultA.extractedRows.length
-          : 0;
-
-        let bestVariant = 'A';
-        let bestRows = pageResultA.extractedRows;
-        let bestOcrText = retA.data.text;
-        let bestBlocks = retA.data.blocks;
-        let bestBuffer = optimizedPageBufferA;
-
-        const isStandardPassWeak = pageResultA.extractedRows.length < 5 || avgConfA < 70;
-
-        if (!IS_PROD && isStandardPassWeak && pageResultA.extractedRows.length > 0) {
-          console.log(`[OCR Debug] Standard pass for Page ${p} is weak (rows: ${pageResultA.extractedRows.length}, avgConf: ${avgConfA}%). Running multi-pass preprocessing...`);
-
-          // Pass B: Threshold
-          try {
-            const sharpPipelineB = sharp(imgObj.data, { raw: { width: imgObj.width, height: imgObj.height, channels: channels } });
-            if (scale > 1) {
-              sharpPipelineB.resize({ width: imgObj.width * scale, height: imgObj.height * scale, kernel: sharp.kernel.lanczos3 });
-            }
-            const optimizedPageBufferB = await sharpPipelineB
-              .trim({ background: '#ffffff', threshold: 15 })
-              .greyscale()
-              .threshold(160)
-              .png()
-              .toBuffer();
-
-            const retB = await worker.recognize(optimizedPageBufferB, {}, { blocks: true });
-            const pageResultB = parseExtractedTextWithLayout(retB.data.text, retB.data.blocks, p, fileName, {}, corrections);
-            const avgConfB = pageResultB.extractedRows.length > 0
-              ? pageResultB.extractedRows.reduce((sum, r) => sum + r.confidence, 0) / pageResultB.extractedRows.length
-              : 0;
-
-            if (pageResultB.extractedRows.length > bestRows.length || (pageResultB.extractedRows.length === bestRows.length && avgConfB > avgConfA)) {
-              bestVariant = 'B';
-              bestRows = pageResultB.extractedRows;
-              bestOcrText = retB.data.text;
-              bestBlocks = retB.data.blocks;
-              bestBuffer = optimizedPageBufferB;
-            }
-          } catch (errB) {
-            console.error("Error in preprocessing pass B:", errB);
+          // Determine if this specific page is truncated
+          const isTruncated = pageViewports.find(v => v.p === p)?.width < 0.90 * maxPdfPageWidth;
+          if (isTruncated) {
+            console.log(`[OCR Debug] Page ${p} width is narrower than document maximum. Tagged as TRUNCATED.`);
           }
 
-          // Pass C: Enlarged 2x
-          try {
-            const sharpPipelineC = sharp(imgObj.data, { raw: { width: imgObj.width, height: imgObj.height, channels: channels } });
-            sharpPipelineC.resize({ width: imgObj.width * scale * 2, height: imgObj.height * scale * 2, kernel: sharp.kernel.lanczos3 });
-            const optimizedPageBufferC = await sharpPipelineC
-              .trim({ background: '#ffffff', threshold: 15 })
-              .greyscale()
-              .sharpen()
-              .png()
-              .toBuffer();
+          const pageRes = await processPageImage(
+            imgObj.data,
+            { width: imgObj.width, height: imgObj.height, channels },
+            p,
+            fileName,
+            isTruncated,
+            corrections,
+            worker
+          );
 
-            const retC = await worker.recognize(optimizedPageBufferC, {}, { blocks: true });
-            const pageResultC = parseExtractedTextWithLayout(retC.data.text, retC.data.blocks, p, fileName, {}, corrections);
-            const avgConfC = pageResultC.extractedRows.length > 0
-              ? pageResultC.extractedRows.reduce((sum, r) => sum + r.confidence, 0) / pageResultC.extractedRows.length
-              : 0;
+          allRows.push(...pageRes.rows);
 
-            const currentBestLen = bestRows.length;
-            const currentBestConf = bestRows.reduce((sum, r) => sum + r.confidence, 0) / (bestRows.length || 1);
-
-            if (pageResultC.extractedRows.length > currentBestLen || (pageResultC.extractedRows.length === currentBestLen && avgConfC > currentBestConf)) {
-              bestVariant = 'C';
-              bestRows = pageResultC.extractedRows;
-              bestOcrText = retC.data.text;
-              bestBlocks = retC.data.blocks;
-              bestBuffer = optimizedPageBufferC;
-            }
-          } catch (errC) {
-            console.error("Error in preprocessing pass C:", errC);
-          }
-          console.log(`[OCR Debug] Selected best preprocessing variant: ${bestVariant}`);
-        }
-
-        // Check if secondary crop OCR is needed
-        let needsSecondaryCrop = false;
-        for (const row of bestRows) {
-          const hasLowConf = row.cityConfidence < 70 || row.phoneConfidence < 70 || row.amountConfidence < 70;
-          const hasInvalidPhone = !row.phoneNumber || !/^[6-9]\d{9}$/.test(row.phoneNumber);
-          const hasSuspiciousAmount = !row.amount || parseFloat(row.amount) === 0 || row.amount.toString().length >= 10 || 
-                                      (row.amount.toString().length >= 8 && row.amount.toString().startsWith('1')) ||
-                                      row.phoneNumber === row.amount.toString() ||
-                                      row.needsReview || row.status === 'Needs Review';
-          
-          if (hasLowConf || hasInvalidPhone || hasSuspiciousAmount) {
-            needsSecondaryCrop = true;
-            break;
-          }
-        }
-
-        let cropData = {};
-        if (needsSecondaryCrop && !IS_PROD) {
-          console.log(`[OCR Debug] Page ${p}: Identified rows needing correction. Running secondary cropped column OCR passes...`);
-          let maxX = 0;
-          let maxY = 0;
-          if (bestBlocks) {
-            for (const block of bestBlocks) {
-              if (block.paragraphs) {
-                for (const para of block.paragraphs) {
-                  if (para.lines) {
-                    for (const line of para.lines) {
-                      if (line.bbox) {
-                        if (line.bbox.x1 > maxX) maxX = line.bbox.x1;
-                        if (line.bbox.y1 > maxY) maxY = line.bbox.y1;
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          if (maxX === 0) maxX = MIN_WIDTH;
-          if (maxY === 0) maxY = 4000;
-
-          const candidateLines = [];
-          if (bestBlocks) {
-            for (const block of bestBlocks) {
-              if (block.paragraphs) {
-                for (const para of block.paragraphs) {
-                  if (para.lines) {
-                    for (const line of para.lines) {
-                      if (/PINCODE/i.test(line.text)) {
-                        candidateLines.push(line);
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-          const rightmostX0s = [];
-          let phoneX0s = [];
-          let phoneX1s = [];
-
-          for (const line of candidateLines) {
-            const words = line.words || [];
-            for (let i = words.length - 1; i >= 0; i--) {
-              const w = words[i];
-              const text = w.text || '';
-              const cleanWord = text.replace(/[^a-zA-Z0-9]/g, '');
-              const hasDigits = /[0-9]/.test(text) || /Tooooo/i.test(text) || /Tase000/i.test(text) || /Toso/i.test(text);
-
-              if (hasDigits && cleanWord.length >= 3) {
-                if (w.bbox && w.bbox.x0 > 0.80 * maxX) {
-                  rightmostX0s.push(w.bbox.x0);
-                  break;
-                }
-              }
-            }
-
-            words.forEach(w => {
-              const text = w.text || '';
-              if (/PHONE|MOBILE|PH|MOB/i.test(text) || (/^[6-9]\d{9}$/.test(text.replace(/\D/g, '')))) {
-                if (w.bbox) {
-                  phoneX0s.push(w.bbox.x0);
-                  phoneX1s.push(w.bbox.x1);
-                }
-              }
+          if (IS_PROD) {
+            pageStats.push({
+              pageNumber: p,
+              extractedRows: pageRes.rows.length,
+              ocrTextLength: pageRes.ocrText.length
+            });
+          } else {
+            debugData.push({
+              inputType: 'pdf',
+              pageNumber: p,
+              ...pageRes.qualityMeta,
+              rawText: pageRes.ocrText,
+              rawLines: pageRes.rows.map(r => r.originalText),
+              candidateLines: pageRes.rows.map(r => r.originalText),
+              extractedRows: pageRes.rows
             });
           }
 
-          let amountColStart = Math.round(0.825 * maxX);
-          if (rightmostX0s.length > 0) {
-            const sorted = rightmostX0s.sort((a, b) => a - b);
-            const minX0 = sorted[0];
-            amountColStart = Math.max(Math.round(0.80 * maxX), Math.min(Math.round(0.83 * maxX), minX0 - 10));
+          console.log(`[OCR Debug] Processed page ${p} / ${pageCount}. Rows: ${pageRes.rows.length}`);
+
+          if (isProductionPdfMemoryUnsafe()) {
+            const warning = `Production PDF OCR stopped after page ${p} because memory reached ${getMemorySnapshot().rssMb} MB RSS. Returning partial result.`;
+            console.warn(`[OCR Warning] ${warning}`);
+            if (typeof onProgress === 'function') {
+              onProgress({
+                currentPage: p,
+                totalPages: pageCount,
+                message: warning
+              });
+            }
+            try {
+              await loadingTask.destroy();
+            } catch (destroyErr) {
+              console.warn('[OCR Memory] PDF destroy failed after partial result:', destroyErr);
+            }
+            return {
+              rows: allRows,
+              pageCount,
+              totalExtracted: allRows.length,
+              needsReviewCount: allRows.filter(r => r.needsReview || r.status !== 'OK').length,
+              warning,
+              partial: true,
+              pageStats
+            };
           }
 
-          let phoneColStart = Math.round(0.50 * maxX);
-          let phoneColEnd = Math.round(0.80 * maxX);
-          if (phoneX0s.length > 0 && phoneX1s.length > 0) {
-            phoneColStart = Math.max(0, Math.min(...phoneX0s) - 20);
-            phoneColEnd = Math.min(maxX, Math.max(...phoneX1s) + 20);
-          }
-          if (phoneColEnd >= amountColStart) {
-            phoneColEnd = amountColStart - 20;
-          }
-
-          // Secondary Pass: Amount Crop
-          try {
-            let cropLeft = Math.max(0, Math.min(amountColStart + 10, maxX - 10));
-            let cropWidth = Math.max(10, maxX - cropLeft);
-            const amountCropBuffer = await sharp(bestBuffer)
-              .extract({ left: cropLeft, top: 0, width: cropWidth, height: maxY })
-              .toBuffer();
-
-            await worker.setParameters({ tessedit_char_whitelist: '0123456789\n\r ' });
-            const amtCropRet = await worker.recognize(amountCropBuffer, {}, { blocks: true });
-            cropData.amountCropBlocks = amtCropRet.data.blocks;
-          } catch (cropAmtErr) {
-            console.error("Secondary crop amount OCR failure:", cropAmtErr);
-          }
-
-          // Secondary Pass: Phone Crop
-          try {
-            let cropLeft = Math.max(0, phoneColStart);
-            let cropWidth = Math.max(10, phoneColEnd - phoneColStart);
-            const phoneCropBuffer = await sharp(bestBuffer)
-              .extract({ left: cropLeft, top: 0, width: cropWidth, height: maxY })
-              .toBuffer();
-
-            await worker.setParameters({ tessedit_char_whitelist: '0123456789\n\r ' });
-            const phoneCropRet = await worker.recognize(phoneCropBuffer, {}, { blocks: true });
-            cropData.phoneCropBlocks = phoneCropRet.data.blocks;
-          } catch (cropPhoneErr) {
-            console.error("Secondary crop phone OCR failure:", cropPhoneErr);
-          }
-
-          await worker.setParameters({ tessedit_char_whitelist: '' });
-
-          const finalPageResult = parseExtractedTextWithLayout(bestOcrText, bestBlocks, p, fileName, cropData, corrections);
-          bestRows = finalPageResult.extractedRows;
-        }
-
-          allRows.push(...bestRows);
-          
-          debugData.push({
-            pageNumber: p,
-            rawText: bestOcrText,
-            rawLines: bestRows.map(r => r.originalText),
-            candidateLines: bestRows.map(r => r.originalText),
-            extractedRows: bestRows
-          });
-          
-          console.log(`[OCR Debug] Processed page ${p} / ${pageCount}`);
-          console.log(`  - OCR text length: ${bestOcrText.length} characters`);
-          console.log(`  - Final extracted rows: ${bestRows.length}`);
         } catch (pageErr) {
           console.error(`[OCR Error] Page ${p} processing failed:`, pageErr);
-          debugData.push({ pageNumber: p, error: pageErr && pageErr.message ? pageErr.message : String(pageErr) });
+          if (IS_PROD) {
+            pageStats.push({ pageNumber: p, error: pageErr?.message || String(pageErr) });
+          } else {
+            debugData.push({ pageNumber: p, error: pageErr?.message || String(pageErr) });
+          }
         } finally {
-          console.log(`PDF page ${p} completed`);
+          if (typeof onProgress === 'function') {
+            onProgress({
+              currentPage: p,
+              totalPages: pageCount,
+              message: `Completed page ${p} of ${pageCount}`
+            });
+          }
           try {
-            console.log(`Memory usage after page ${p}: ${JSON.stringify(process.memoryUsage())}`);
-          } catch (e) {
-            // ignore
+            page?.cleanup?.();
+          } catch (cleanupErr) {
+            console.warn(`[OCR Memory] Page ${p} cleanup failed:`, cleanupErr);
+          }
+          page = null;
+          opList = null;
+          imgObj = null;
+          logMemory(`after page ${p}`);
+          if (global.gc) {
+            global.gc();
           }
         }
       }
     } else {
       throw new Error(`Unsupported file type: ${mimeType}`);
     }
-    
-    // Save raw_ocr_debug.json (only in non-production)
+
+    // Save raw_ocr_debug.json
     if (!IS_PROD) {
       try {
         fs.writeFileSync(
-          path.join(process.cwd(), 'raw_ocr_debug.json'),
+          path.join(os.tmpdir(), 'paisadu_raw_ocr_debug.json'),
           JSON.stringify(debugData, null, 2)
         );
         console.log(`[OCR Debug] Successfully saved raw_ocr_debug.json`);
@@ -1547,17 +1683,17 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
         console.error('Failed to write raw_ocr_debug.json:', e);
       }
     }
-    console.log(`[OCR Debug] Total PDF pages processed: ${pageCount}`);
-    
+    console.log(`[OCR Debug] Total pages/images processed: ${pageCount}`);
+
   } catch (err) {
     console.error('Error during OCR execution:', err);
     return {
       error: true,
-      message: err && err.message ? err.message : String(err),
+      message: err?.message || String(err),
       rows: allRows,
       pageCount,
       totalExtracted: allRows.length,
-      needsReviewCount: allRows.filter(r => r.needsReview || r.status === 'Needs Review').length
+      needsReviewCount: allRows.filter(r => r.needsReview || r.status !== 'OK').length
     };
   } finally {
     await worker.terminate();
@@ -1567,6 +1703,6 @@ export async function processFileForOcr(fileBuffer, mimeType, fileName) {
     rows: allRows,
     pageCount,
     totalExtracted: allRows.length,
-    needsReviewCount: allRows.filter(r => r.needsReview || r.status === 'Needs Review').length
+    needsReviewCount: allRows.filter(r => r.needsReview || r.status !== 'OK').length
   };
 }

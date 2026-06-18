@@ -32,11 +32,36 @@ export interface UploadedDocument {
 export interface ApiExtractResponse {
   success: boolean;
   message: string;
-  fileName: string;
-  pageCount: number;
-  rows: Omit<ExtractedRow, 'id'>[];
-  totalExtracted: number;
-  needsReviewCount: number;
+  async?: boolean;
+  jobId?: string;
+  fileName?: string;
+  pageCount?: number;
+  rows?: Omit<ExtractedRow, 'id'>[];
+  totalExtracted?: number;
+  needsReviewCount?: number;
+  warning?: string | null;
+  partial?: boolean;
+  pageStats?: Array<{
+    pageNumber: number;
+    extractedRows?: number;
+    ocrTextLength?: number;
+    error?: string;
+  }>;
+}
+
+export interface ExtractJobProgress {
+  currentPage: number;
+  totalPages: number;
+  message: string;
+}
+
+export interface ApiExtractStatusResponse {
+  success: boolean;
+  jobId: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  progress: ExtractJobProgress | null;
+  result: ApiExtractResponse | null;
+  error: string | null;
 }
 
 export interface ProcessingOptions {

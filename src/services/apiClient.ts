@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { saveAs } from 'file-saver';
-import { ApiExtractResponse, ExtractedRow } from '../types';
+import { ApiExtractResponse, ApiExtractStatusResponse, ExtractedRow } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001';
 console.log("API_BASE_URL:", API_BASE_URL);
@@ -47,6 +47,28 @@ export class ExpressApiClient {
         throw new Error('Backend server is not running. Please start backend on port 5001 and try again.');
       } else {
         throw new Error('Error triggering extraction request.');
+      }
+    }
+  }
+
+  public async getExtractStatus(jobId: string): Promise<ApiExtractStatusResponse> {
+    try {
+      const res = await axios.get<ApiExtractStatusResponse>(
+        `${API_BASE_URL}/api/extract/status/${jobId}`,
+        { timeout: 15000 }
+      );
+      return res.data;
+    } catch (error: any) {
+      console.error("Extraction status error code:", error.code);
+      console.error("Extraction status response:", error.response?.data);
+      console.error("Extraction status message:", error.message);
+
+      if (error.response) {
+        throw new Error(error.response.data?.error || error.response.data?.message || 'Error checking extraction status.');
+      } else if (error.request) {
+        throw new Error('Backend server is not responding while checking extraction status.');
+      } else {
+        throw new Error('Error checking extraction status.');
       }
     }
   }

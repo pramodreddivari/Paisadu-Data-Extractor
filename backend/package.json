@@ -8,7 +8,7 @@
     "node": "20.x"
   },
   "scripts": {
-    "start": "node server.js",
+    "start": "node --expose-gc server.js",
     "dev": "node --watch server.js",
     "test:extract": "node test-extract.js"
   },

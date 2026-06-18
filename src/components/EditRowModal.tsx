@@ -108,7 +108,6 @@ export const EditRowModal: React.FC<EditRowModalProps> = ({ isOpen, onClose, onS
               onChange={(e) => setCity(e.target.value)}
               placeholder="e.g. HYDERABAD, BANGALORE"
               className="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-slate-900 dark:text-white font-black tracking-wide focus:ring-2 focus:ring-cyan-500 dark:focus:ring-cyan-400 focus:outline-none transition"
-              required
             />
           </div>
 
@@ -123,7 +122,6 @@ export const EditRowModal: React.FC<EditRowModalProps> = ({ isOpen, onClose, onS
               onChange={(e) => setPhoneNumber(e.target.value)}
               placeholder="e.g. 8801861960"
               className="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-slate-900 dark:text-white font-mono font-medium focus:ring-2 focus:ring-cyan-500 dark:focus:ring-cyan-400 focus:outline-none transition"
-              required
             />
           </div>
 
@@ -141,7 +139,6 @@ export const EditRowModal: React.FC<EditRowModalProps> = ({ isOpen, onClose, onS
                 onChange={(e) => setAmount(e.target.value)}
                 placeholder="e.g. 4500000"
                 className="w-full pl-8 pr-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-emerald-600 dark:text-emerald-400 font-bold focus:ring-2 focus:ring-cyan-500 dark:focus:ring-cyan-400 focus:outline-none transition"
-                required
               />
             </div>
           </div>

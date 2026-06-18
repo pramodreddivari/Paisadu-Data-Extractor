@@ -5,8 +5,10 @@ import { ExtractionProgress } from './components/ExtractionProgress';
 import { DataTable } from './components/DataTable';
 import { EditRowModal } from './components/EditRowModal';
 import { expressApiClient } from './services/apiClient';
-import { ExtractedRow } from './types';
+import { ApiExtractResponse, ExtractedRow } from './types';
 import { AlertCircle, X } from 'lucide-react';
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const AppComponent: React.FC = () => {
   const [rows, setRows] = useState<ExtractedRow[]>([]);
@@ -29,6 +31,28 @@ const AppComponent: React.FC = () => {
   });
 
   const [editingRow, setEditingRow] = useState<ExtractedRow | null>(null);
+
+  const applyExtractionResult = useCallback((apiRes: ApiExtractResponse) => {
+    if (!apiRes.rows || apiRes.rows.length === 0) {
+      throw new Error(apiRes.message || 'Empty extracted data. We could not detect any valid customer records or amounts in this document.');
+    }
+
+    const finalizedRows: ExtractedRow[] = apiRes.rows.map((r, i) => ({
+      ...r,
+      id: `rec-${Date.now()}-${i}`,
+      sNo: r.sNo || i + 1,
+      rowNumber: r.rowNumber || r.sNo || i + 1,
+      pageNo: r.pageNo || r.pageNumber || 1,
+      pageNumber: r.pageNumber || r.pageNo || 1,
+      status: r.status || (r.needsReview ? 'Needs Review' : 'OK')
+    }));
+
+    setRows(finalizedRows);
+
+    setTimeout(() => {
+      document.getElementById('extraction-results-table')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
+  }, []);
 
   // Main Customer Extraction Trigger (Called ONLY when user clicks Extract Data)
   const executeDataExtraction = useCallback(
@@ -68,8 +92,47 @@ const AppComponent: React.FC = () => {
         }, 700);
 
         // Directly call POST /api/extract
-        const apiRes = await expressApiClient.extractFile(file);
+        let apiRes = await expressApiClient.extractFile(file);
         
+        if (apiRes.async && apiRes.jobId) {
+          setOcrProgress(prev => ({
+            ...prev,
+            loadingStatus: apiRes.message || 'PDF extraction started',
+            currentPage: 0,
+            totalPages: 0
+          }));
+
+          let completedResult: ApiExtractResponse | null = null;
+
+          while (!completedResult) {
+            await delay(5000);
+            const statusRes = await expressApiClient.getExtractStatus(apiRes.jobId);
+            const progress = statusRes.progress;
+
+            setOcrProgress(prev => ({
+              ...prev,
+              loadingStatus: progress?.message || (statusRes.status === 'pending' ? 'PDF extraction queued' : 'Processing PDF...'),
+              currentPage: progress?.currentPage ?? prev.currentPage,
+              totalPages: progress?.totalPages ?? prev.totalPages
+            }));
+
+            if (statusRes.status === 'completed') {
+              completedResult = statusRes.result;
+              break;
+            }
+
+            if (statusRes.status === 'failed') {
+              throw new Error(statusRes.error || 'PDF extraction failed.');
+            }
+          }
+
+          if (!completedResult) {
+            throw new Error('PDF extraction finished without a result.');
+          }
+
+          apiRes = completedResult;
+        }
+
         const totalPages = apiRes.pageCount || 1;
 
         setOcrProgress({
@@ -80,23 +143,7 @@ const AppComponent: React.FC = () => {
           fileName: file.name
         });
 
-        // Map formatted rows
-        const finalizedRows: ExtractedRow[] = apiRes.rows.map((r, i) => ({
-          ...r,
-          id: `rec-${Date.now()}-${i}`,
-          sNo: r.sNo || i + 1,
-          rowNumber: r.rowNumber || r.sNo || i + 1,
-          pageNo: r.pageNo || r.pageNumber || 1,
-          pageNumber: r.pageNumber || r.pageNo || 1,
-          status: r.status || (r.needsReview ? 'Needs Review' : 'OK')
-        }));
-
-        setRows(finalizedRows);
-
-        // Instantly smooth scroll to preview table
-        setTimeout(() => {
-          document.getElementById('extraction-results-table')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }, 100);
+        applyExtractionResult(apiRes);
 
       } catch (err: any) {
         console.error('Extraction failure:', err);
@@ -107,7 +154,7 @@ const AppComponent: React.FC = () => {
         }, 1200);
       }
     },
-    []
+    [applyExtractionResult]
   );
 
   const handleUpdateRow = (updatedRow: ExtractedRow) => {

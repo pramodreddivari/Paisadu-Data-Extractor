@@ -80,6 +80,10 @@ export const DataTable: React.FC<DataTableProps> = ({ rows, setRows, onEditRow, 
   // Small Summary counts
   const okCount = rows.filter(r => r.status === 'OK' && !r.needsReview).length;
   const reviewCount = rows.filter(r => r.status === 'Needs Review' || r.needsReview).length;
+  const missingAmountReviewCount = rows.filter(
+    r => (r.status === 'Needs Review' || r.needsReview) && 
+         (!r.amount || parseFloat(r.amount.toString()) === 0 || r.amount.toString() === '0')
+  ).length;
 
   return (
     <div id="extraction-results-table" className="w-full bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-800 shadow-2xl overflow-hidden mt-8 animate-fadeIn select-none">
@@ -167,6 +171,15 @@ export const DataTable: React.FC<DataTableProps> = ({ rows, setRows, onEditRow, 
 
       </div>
 
+      {missingAmountReviewCount >= 3 && (
+        <div className="mx-6 my-4 p-4 bg-amber-500/10 text-amber-800 dark:text-amber-200 border border-amber-500/30 rounded-2xl flex items-start space-x-3 select-none animate-fadeIn">
+          <AlertTriangle className="w-5 h-5 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
+          <p className="text-xs sm:text-sm font-bold leading-relaxed">
+            Some rows may need manual review because the source PDF page may be truncated or the amount column may be missing.
+          </p>
+        </div>
+      )}
+
       {/* Main Extracted Records Table */}
       <div className="overflow-x-auto min-h-[220px]">
         <table className="w-full text-left border-collapse font-sans">
@@ -216,19 +229,37 @@ export const DataTable: React.FC<DataTableProps> = ({ rows, setRows, onEditRow, 
                   </td>
 
                   <td className="py-4 px-6 text-center">
-                    {isReview ? (
-                      <span 
-                        className="inline-flex items-center space-x-1.5 px-3 py-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/40 rounded-full font-black text-xs cursor-pointer hover:bg-rose-500/25 transition shadow-sm"
-                        onClick={() => onEditRow(row)}
-                        title={`Needs review. Click edit icon to resolve.`}
-                      >
-                        <AlertTriangle className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400 shrink-0" />
-                        <span>Needs Review</span>
-                      </span>
-                    ) : (
+                    {row.status === 'OK' ? (
                       <span className="inline-flex items-center space-x-1.5 px-3 py-1 bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/40 rounded-full font-black text-xs shadow-sm select-none">
                         <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
                         <span>OK</span>
+                      </span>
+                    ) : row.status === 'Source Truncated / Missing Amount' ? (
+                      <span 
+                        className="inline-flex items-center space-x-1.5 px-3 py-1 bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/40 rounded-full font-black text-xs cursor-pointer hover:bg-amber-500/25 transition shadow-sm"
+                        onClick={() => onEditRow(row)}
+                        title="Source Truncated / Missing Amount. Click edit icon to resolve."
+                      >
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
+                        <span>Source Truncated</span>
+                      </span>
+                    ) : row.status === 'Low OCR Confidence' ? (
+                      <span 
+                        className="inline-flex items-center space-x-1.5 px-3 py-1 bg-purple-500/15 text-purple-700 dark:text-purple-300 border border-purple-500/40 rounded-full font-black text-xs cursor-pointer hover:bg-purple-500/25 transition shadow-sm"
+                        onClick={() => onEditRow(row)}
+                        title="Low OCR Confidence. Click edit icon to resolve."
+                      >
+                        <AlertTriangle className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400 shrink-0" />
+                        <span>Low OCR Confidence</span>
+                      </span>
+                    ) : (
+                      <span 
+                        className="inline-flex items-center space-x-1.5 px-3 py-1 bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/40 rounded-full font-black text-xs cursor-pointer hover:bg-rose-500/25 transition shadow-sm"
+                        onClick={() => onEditRow(row)}
+                        title="Needs review. Click edit icon to resolve."
+                      >
+                        <AlertTriangle className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400 shrink-0" />
+                        <span>Needs Review</span>
                       </span>
                     )}
                   </td>

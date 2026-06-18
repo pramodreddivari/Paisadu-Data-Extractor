@@ -5,6 +5,7 @@ import xlsx from 'xlsx';
 import PDFDocument from 'pdfkit';
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { processFileForOcr } from './ocrService.js';
 
 const app = express();
@@ -44,11 +45,98 @@ const upload = multer({
   }
 });
 
+const OCR_JOB_TTL_MS = 30 * 60 * 1000;
+const ocrJobs = new Map();
+
+function scheduleJobCleanup(jobId) {
+  setTimeout(() => {
+    ocrJobs.delete(jobId);
+  }, OCR_JOB_TTL_MS).unref();
+}
+
+function buildExtractionPayload(result, fileName, message = 'Extraction completed successfully') {
+  return {
+    success: true,
+    message: result.warning || message,
+    fileName,
+    pageCount: result.pageCount,
+    rows: result.rows,
+    totalExtracted: result.totalExtracted,
+    needsReviewCount: result.needsReviewCount,
+    warning: result.warning || null,
+    partial: result.partial || false,
+    pageStats: result.pageStats || undefined
+  };
+}
+
+function isEmptyExtractionResult(result) {
+  return !Array.isArray(result.rows) || result.rows.length === 0;
+}
+
+async function runPdfExtractionJob(jobId, fileBuffer, mimeType, fileName) {
+  const job = ocrJobs.get(jobId);
+  if (!job) return;
+
+  job.status = 'processing';
+  job.progress = {
+    currentPage: 0,
+    totalPages: 0,
+    message: 'PDF extraction started'
+  };
+
+  try {
+    const result = await processFileForOcr(fileBuffer, mimeType, fileName, (progress) => {
+      const latestJob = ocrJobs.get(jobId);
+      if (!latestJob) return;
+      latestJob.progress = {
+        currentPage: progress.currentPage ?? latestJob.progress.currentPage ?? 0,
+        totalPages: progress.totalPages ?? latestJob.progress.totalPages ?? 0,
+        message: progress.message || latestJob.progress.message || 'Processing PDF'
+      };
+    });
+
+    if (!result || result.error) {
+      throw new Error(result && result.message ? result.message : 'OCR processing failed on the server.');
+    }
+
+    if (isEmptyExtractionResult(result) && !result.partial) {
+      const emptyResultError = new Error('Empty extracted data. We could not detect any valid customer records or amounts in this document. Please verify image quality or orientation.');
+      emptyResultError.statusCode = 422;
+      throw emptyResultError;
+    }
+
+    const completedJob = ocrJobs.get(jobId);
+    if (!completedJob) return;
+
+    completedJob.status = 'completed';
+    completedJob.progress = {
+      currentPage: result.pageCount || completedJob.progress.currentPage || 0,
+      totalPages: result.pageCount || completedJob.progress.totalPages || 0,
+      message: result.warning || 'Extraction completed successfully'
+    };
+    completedJob.result = buildExtractionPayload(result, fileName);
+    completedJob.error = null;
+    scheduleJobCleanup(jobId);
+  } catch (error) {
+    console.error(`OCR job ${jobId} failed:`, error);
+    const failedJob = ocrJobs.get(jobId);
+    if (!failedJob) return;
+
+    failedJob.status = 'failed';
+    failedJob.error = error.message || 'OCR extraction failed due to unreadable document formatting.';
+    failedJob.progress = {
+      ...failedJob.progress,
+      message: failedJob.error
+    };
+    scheduleJobCleanup(jobId);
+  }
+}
+
 app.get('/api', (req, res) => {
   res.json({
     service: 'Paisadu Data Extractor Enterprise Backend API',
     status: 'operational',
-    endpoints: ['POST /api/extract', 'POST /api/export/excel', 'POST /api/export/pdf'],
+    endpoints: ['POST /api/extract', 'GET /api/extract/status/:jobId', 'POST /api/export/excel', 'POST /api/export/pdf'],
     timestamp: new Date().toISOString()
   });
 });
@@ -57,13 +145,36 @@ app.get('/api/health', (req, res) => {
   res.json({ success: true, message: "Backend running", port: 5001 });
 });
 
+app.get('/api/extract/status/:jobId', (req, res) => {
+  const job = ocrJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      jobId: req.params.jobId,
+      status: 'failed',
+      progress: null,
+      result: null,
+      error: 'Extraction job was not found or has expired.'
+    });
+  }
+
+  res.json({
+    success: true,
+    jobId: job.id,
+    status: job.status,
+    progress: job.progress,
+    result: job.result,
+    error: job.error
+  });
+});
+
 function getCorrectionsPath() {
   const cwd = process.cwd();
   if (fs.existsSync(path.join(cwd, 'backend'))) {
-    return path.join(cwd, 'backend', 'corrections.json');
+    return path.join(cwd, 'corrections.json');
   }
   if (path.basename(cwd) === 'backend') {
-    return path.join(cwd, 'corrections.json');
+    return path.join(path.dirname(cwd), 'corrections.json');
   }
   return path.join(cwd, 'corrections.json');
 }
@@ -131,28 +242,48 @@ app.post('/api/extract', (req, res) => {
       const { originalname, mimetype, buffer } = req.file;
       console.log(`Executing Pro Backend OCR extraction for: ${originalname} (${mimetype}), Size: ${(buffer.length / (1024 * 1024)).toFixed(2)} MB`);
 
+      if (mimetype === 'application/pdf') {
+        const jobId = randomUUID();
+        const fileBuffer = Buffer.from(buffer);
+        ocrJobs.set(jobId, {
+          id: jobId,
+          status: 'pending',
+          progress: {
+            currentPage: 0,
+            totalPages: 0,
+            message: 'PDF extraction queued'
+          },
+          result: null,
+          error: null,
+          createdAt: new Date().toISOString()
+        });
+
+        setImmediate(() => {
+          runPdfExtractionJob(jobId, fileBuffer, mimetype, originalname);
+        });
+
+        return res.json({
+          success: true,
+          async: true,
+          jobId,
+          message: 'PDF extraction started'
+        });
+      }
+
       const result = await processFileForOcr(buffer, mimetype, originalname);
       if (!result || result.error) {
         console.error('OCR service returned an error:', result && result.message ? result.message : result);
         return res.status(500).json({ success: false, message: result && result.message ? result.message : 'OCR processing failed on the server.', rows: result && result.rows ? result.rows : [] });
       }
 
-      if (!Array.isArray(result.rows) || result.rows.length === 0) {
+      if (isEmptyExtractionResult(result) && !result.partial) {
         return res.status(422).json({
           success: false,
           message: 'Empty extracted data. We could not detect any valid customer records or amounts in this document. Please verify image quality or orientation.'
         });
       }
 
-      res.json({
-        success: true,
-        message: 'Extraction completed successfully',
-        fileName: originalname,
-        pageCount: result.pageCount,
-        rows: result.rows,
-        totalExtracted: result.totalExtracted,
-        needsReviewCount: result.needsReviewCount
-      });
+      res.json(buildExtractionPayload(result, originalname));
     } catch (ocrErr) {
       console.error('API /api/extract failure:', ocrErr);
       res.status(500).json({
@@ -196,7 +327,7 @@ app.post('/api/export/excel', (req, res) => {
         'City': row.city || '',
         'Phone Number': row.phoneNumber || '', // We will explicitly force cell text formatting below
         'Amount': Number(row.amount) || row.amount || 0,
-        'Status': (row.status === 'OK' && !row.needsReview) ? 'OK' : 'Needs Review',
+        'Status': row.status || (row.needsReview ? 'Needs Review' : 'OK'),
         'Original OCR Text': row.originalOcrText || ''
       });
     });
@@ -324,7 +455,7 @@ app.post('/api/export/pdf', (req, res) => {
           doc.rect(startX, currentY, availableWidth, rowHeight).fill('#f8fafc');
         }
 
-        const isNeedsReview = row.needsReview || row.status === 'Needs Review';
+        const isNeedsReview = row.needsReview || row.status !== 'OK';
         if (isNeedsReview) {
           doc.rect(startX, currentY, availableWidth, rowHeight).fill('#fef2f2');
         }
@@ -339,8 +470,8 @@ app.post('/api/export/pdf', (req, res) => {
         doc.font('Helvetica-Bold').fillColor('#16a34a').fontSize(9);
         doc.text(`${row.amount || '0'}`, startX + colWidths[0] + colWidths[1] + colWidths[2] + colWidths[3] + 5, currentY + 7);
 
-        doc.font('Helvetica-Bold').fillColor(isNeedsReview ? '#dc2626' : '#16a34a').fontSize(9);
-        doc.text(isNeedsReview ? 'Needs Review' : 'OK', startX + colWidths[0] + colWidths[1] + colWidths[2] + colWidths[3] + colWidths[4] + 5, currentY + 7);
+        doc.font('Helvetica-Bold').fillColor(isNeedsReview ? '#dc2626' : '#16a34a').fontSize(7.5);
+        doc.text(row.status || (isNeedsReview ? 'Needs Review' : 'OK'), startX + colWidths[0] + colWidths[1] + colWidths[2] + colWidths[3] + colWidths[4] + 5, currentY + 7);
 
         doc.y = currentY + rowHeight;
       });
